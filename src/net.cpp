@@ -65,6 +65,9 @@ static map<CNetAddr, LocalServiceInfo> mapLocalHost;
 static bool vfReachable[NET_MAX] = {};
 static bool vfLimited[NET_MAX] = {};
 static CNode* pnodeLocalHost = NULL;
+CNode* pnodeSync = NULL;
+CNode* pnodeLastSync = NULL;
+
 CAddress addrSeenByPeer(CService("0.0.0.0", 0), nLocalServices);
 uint64 nLocalHostNonce = 0;
 array<int, THREAD_MAX> vnThreadsRunning;
@@ -157,8 +160,10 @@ int GetMaxOutboundConnections()
 void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
 {
     // Filter out duplicate requests
-    if (pindexBegin == pindexLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd)
+    if (pindexBegin == pindexLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd){
+		printf("duplicate PushGetBlocks request, ip:%s, hashEnd:%s\n", addr.ToString().c_str(), hashEnd.ToString().c_str());
         return;
+    }
     pindexLastGetBlocksBegin = pindexBegin;
     hashLastGetBlocksEnd = hashEnd;
 
@@ -584,7 +589,8 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest, int64 nTimeout)
 
         {
             LOCK(cs_vNodes);
-            vNodes.push_back(pnode);
+            vNodes.push_back(pnode);			
+			printf("peerinfo, connected node:%s\n", pnode->addr.ToString().c_str());
         }
 
         pnode->nTimeConnected = GetTime();
@@ -596,6 +602,36 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest, int64 nTimeout)
     }
 }
 
+bool CNode::OpenSocket()
+{
+		CService addrConnect;
+		if (ConnectSocketByName(addrConnect, hSocket, addr.ToString().c_str(), GetDefaultPort()))
+		{
+			addrman.Attempt(addrConnect);
+	
+			/// debug print
+			printf("opensocket, connected %s\n", addr.ToString().c_str());
+	
+			// Set to non-blocking
+#ifdef WIN32
+			u_long nOne = 1;
+			if (ioctlsocket(hSocket, FIONBIO, &nOne) == SOCKET_ERROR)
+				printf("opensocket, ConnectSocket() : ioctlsocket non-blocking setting failed, error %d\n", WSAGetLastError());
+#else
+			if (fcntl(hSocket, F_SETFL, O_NONBLOCK) == SOCKET_ERROR)
+				printf("opensocket, ConnectSocket() : fcntl non-blocking setting failed, error %d\n", errno);
+#endif
+	
+			nTimeConnected = GetTime();
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+
+}
+
 void CNode::CloseSocketDisconnect()
 {
     fDisconnect = true;
@@ -604,8 +640,76 @@ void CNode::CloseSocketDisconnect()
         printf("disconnecting node %s\n", addrName.c_str());
         closesocket(hSocket);
         hSocket = INVALID_SOCKET;
-        vRecv.clear();
+        //vRecv.clear();
     }
+
+
+	
+    // in case this fails, we'll empty the recv buffer when the CNode is deleted
+    TRY_LOCK(cs_vRecv, lockRecv);
+    if (lockRecv)
+        vRecv.clear();
+
+	
+    //// if this was the sync node, we'll need a new one
+    if (this == pnodeSync)
+        pnodeSync = NULL;
+}
+
+bool CNode::Reset()
+{
+	SOCKET oldSocket = hSocket;
+    if (hSocket != INVALID_SOCKET)
+    {
+        printf("reset, disconnecting node %s\n", addrName.c_str());
+        closesocket(hSocket);
+        hSocket = INVALID_SOCKET;
+        //vRecv.clear();
+    }
+
+
+	
+    // in case this fails, we'll empty the recv buffer when the CNode is deleted
+   	{
+	    TRY_LOCK(cs_vRecv, lockRecv);
+	    if (lockRecv)
+	    {
+	        vRecv.clear();
+	    }
+    }
+
+	{
+	    TRY_LOCK(cs_vSend, lockSend);
+	    if (lockSend)
+	    {
+	        vSend.clear();
+	    }
+	}
+
+
+	{
+	    TRY_LOCK(cs_inventory, lockInventory);
+	    if (lockInventory)
+	    {
+	        vInventoryToSend.clear();
+			setInventoryKnown.clear();
+			mapAskFor.clear();
+			hashContinue = 0;
+			pindexLastGetBlocksBegin = 0;
+			hashLastGetBlocksEnd = 0;
+			printf("reset, clear conext, node:%s\n", addrName.c_str());
+	    }
+	}
+
+	
+
+	bool ret =  OpenSocket();
+	fReset = false;
+
+	PushVersion();
+
+	printf("reset, ip:%s, oldsocket:%d, newsocket:%d\n", addrName.c_str(), oldSocket, hSocket);
+	return ret;
 }
 
 void CNode::Cleanup()
@@ -746,6 +850,24 @@ void ThreadSocketHandler2(void* parg)
                 if (pnode->fDisconnect ||
                     (pnode->GetRefCount() <= 0 && pnode->vRecv.empty() && pnode->vSend.empty()))
                 {
+                	/*if(!pnode->fDisconnect && pnode->nSpeed > 0 && pnodeSync)
+                	{
+                		//it means this node is waiting for next download, don't disconnect it
+                		continue;
+                	}
+
+					if(!pnode->fDisconnect && !pnode->bUsed && pnodeSync)
+					{
+						//don't disconnect unused node when downloading
+						continue;
+					}*/
+                	printf("peerinfo, remove node:%s, fDisconnect:%d, refcount:%d, recv:%d, send:%d, speed:%d\n", 
+						pnode->addr.ToString().c_str(),
+						pnode->fDisconnect,
+						pnode->GetRefCount(),
+						pnode->vRecv.size(),
+						pnode->vSend.size(),
+						pnode->nSpeed);
                     // remove from vNodes
                     vNodes.erase(remove(vNodes.begin(), vNodes.end(), pnode), vNodes.end());
 
@@ -803,6 +925,21 @@ void ThreadSocketHandler2(void* parg)
             uiInterface.NotifyNumConnectionsChanged(vNodes.size());
         }
 
+		//
+		//reset node, intent to clear sync context such as setInventoryKown on the remote node
+		//
+		
+        {
+            LOCK(cs_vNodes);
+            vector<CNode*> vNodesCopy = vNodes;
+            BOOST_FOREACH(CNode* pnode, vNodesCopy)
+            {
+            	if(pnode->fReset)
+            	{
+                    pnode->Reset();
+            	}
+            }
+		}
 
         //
         // Find which sockets have data to receive
@@ -913,7 +1050,7 @@ void ThreadSocketHandler2(void* parg)
             }
             else
             {
-                printf("accepted connection %s\n", addr.ToString().c_str());
+                printf("peerinfo, accepted node:%s\n", addr.ToString().c_str());
                 CNode* pnode = new CNode(hSocket, addr, "", true);
                 pnode->AddRef();
                 {
@@ -954,7 +1091,7 @@ void ThreadSocketHandler2(void* parg)
 
                     if (nPos > ReceiveBufferSize()) {
                         if (!pnode->fDisconnect)
-                            printf("socket recv flood control disconnect (%"PRIszu" bytes)\n", vRecv.size());
+                            printf("socket recv flood control disconnect (%"PRIszu" bytes), ip:%s\n", vRecv.size(), pnode->addr.ToString().c_str());
                         pnode->CloseSocketDisconnect();
                     }
                     else {
@@ -971,7 +1108,7 @@ void ThreadSocketHandler2(void* parg)
                         {
                             // socket closed gracefully
                             if (!pnode->fDisconnect)
-                                printf("socket closed\n");
+                                printf("socket:%d closed, ip:%s\n", pnode->hSocket,  pnode->addr.ToString().c_str());
                             pnode->CloseSocketDisconnect();
                         }
                         else if (nBytes < 0)
@@ -981,7 +1118,7 @@ void ThreadSocketHandler2(void* parg)
                             if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE && nErr != WSAEINTR && nErr != WSAEINPROGRESS)
                             {
                                 if (!pnode->fDisconnect)
-                                    printf("socket recv error %d\n", nErr);
+                                    printf("socket recv error %d, ip:%s\n", nErr, pnode->addr.ToString().c_str());
                                 pnode->CloseSocketDisconnect();
                             }
                         }
@@ -1014,13 +1151,42 @@ void ThreadSocketHandler2(void* parg)
                             int nErr = WSAGetLastError();
                             if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE && nErr != WSAEINTR && nErr != WSAEINPROGRESS)
                             {
-                                printf("socket send error %d\n", nErr);
+                                printf("socket send error %d, ip:%s\n", nErr, pnode->addr.ToString().c_str());
                                 pnode->CloseSocketDisconnect();
                             }
                         }
                     }
                 }
             }
+
+
+			//heartbeat
+			if(pnodeSync)
+			{
+				bool bSendPing = false;
+				if(!pnode->fDisconnect && pnode->nSpeed > 0)
+				{
+					//it means this node is waiting for next download, don't disconnect it
+					bSendPing = true;
+				}
+				
+				if(!pnode->fDisconnect && !pnode->bUsed)
+				{
+					//don't disconnect unused node when downloading
+					bSendPing = true;
+				}
+
+				if(bSendPing)
+				{
+					uint64 nonce = 0;
+					if(GetTime() - pnode->nLastSend > 10)
+					{
+						//printf("peerinfo, test, send ping to:%s\n", pnode->addr.ToString().c_str());
+						pnode->PushMessage("ping", nonce);
+						pnode->nLastSend = GetTime();
+					}
+				}
+			}
 
             //
             // Inactivity checking
@@ -1031,17 +1197,19 @@ void ThreadSocketHandler2(void* parg)
             {
                 if (pnode->nLastRecv == 0 || pnode->nLastSend == 0)
                 {
-                    printf("socket no message in first 60 seconds, %d %d\n", pnode->nLastRecv != 0, pnode->nLastSend != 0);
+                    printf("socket no message in first 60 seconds, %d %d, ip:%s\n",
+						pnode->nLastRecv != 0, pnode->nLastSend != 0,
+						pnode->addr.ToString().c_str());
                     pnode->fDisconnect = true;
                 }
                 else if (GetTime() - pnode->nLastSend > 90*60 && GetTime() - pnode->nLastSendEmpty > 90*60)
                 {
-                    printf("socket not sending\n");
+                    printf("socket not sending, ip:%s\n", pnode->addr.ToString().c_str());
                     pnode->fDisconnect = true;
                 }
                 else if (GetTime() - pnode->nLastRecv > 90*60)
                 {
-                    printf("socket inactivity timeout\n");
+                    printf("socket inactivity timeout, ip:%s\n", pnode->addr.ToString().c_str());
                     pnode->fDisconnect = true;
                 }
             }
@@ -1291,7 +1459,19 @@ void ThreadDNSAddressSeed2(void* parg)
 
 unsigned int pnSeed[] =
 {
-    0x90EF78BC, 0x33F1C851, 0x36F1C851, 0xC6F5C851,
+    //0x90EF78BC, 0x33F1C851, 0x36F1C851, 0xC6F5C851,
+	//92.5.98.210
+	0xD26205DC,
+	//192.95.29.176
+	0xB01D5FC0,
+	//84.200.27.244
+	0xF41BC854,
+	//107.170.63.233
+	0xE93FAA6B,
+    //115.28.242.21
+    0x15F21C73,
+    //108.216.65.238
+    0xEE41D86C,
 };
 
 void DumpAddresses()
@@ -1614,22 +1794,37 @@ bool OpenNetworkConnection(const CAddress& addrConnect, CSemaphoreGrant *grantOu
     // Initiate outbound network connection
     //
     if (fShutdown)
+    {
+    	printf("shutdown when OpenNetWorkConnection.\n");
         return false;
+    }	
     if (!strDest)
         if (IsLocal(addrConnect) ||
             FindNode((CNetAddr)addrConnect) || CNode::IsBanned(addrConnect) ||
             FindNode(addrConnect.ToStringIPPort().c_str()))
+    {
+    		printf("fail to OpenNetWorkConnection, addr is null.\n");
             return false;
+    }
     if (strDest && FindNode(strDest))
+    {
+    	printf("fail to OpenNetWorkConnection, addr:%s is already connected.\n", strDest);
         return false;
+    }
 
     vnThreadsRunning[THREAD_OPENCONNECTIONS]--;
     CNode* pnode = ConnectNode(addrConnect, strDest);
     vnThreadsRunning[THREAD_OPENCONNECTIONS]++;
     if (fShutdown)
+    {
+    	printf("shutdown when OpenNetWorkConnection, after connectnode.\n");
         return false;
+    }
     if (!pnode)
+    {
+		printf("fail to connectnode:%s in OpenNetWorkConnection.\n", strDest ? strDest : addrConnect.ToString().c_str());
         return false;
+    }
     if (grantOutbound)
         grantOutbound->MoveTo(pnode->grantOutbound);
     pnode->fNetworkNode = true;
@@ -1641,7 +1836,56 @@ bool OpenNetworkConnection(const CAddress& addrConnect, CSemaphoreGrant *grantOu
 
 
 
+CNode * getNodeSync(){
+	return pnodeSync;
+}
 
+// for now, use a very simple selection metric: the node from which we received
+// most recently
+double static NodeSyncScore(const CNode *pnode) {
+    //return -pnode->nLastRecv;
+    return pnode->nSpeed;
+}
+
+void static StartSync(const vector<CNode*> &vNodes) {
+    CNode *pnodeNewSync = NULL;
+    double dBestScore = 0;
+
+    //int nBestHeight = g_signals.GetHeight().get_value_or(0);
+
+    // Iterate over all nodes
+    BOOST_FOREACH(CNode* pnode, vNodes) {
+        // check preconditions for allowing a sync
+        if (!pnode->fClient && !pnode->fOneShot &&
+            !pnode->fDisconnect && pnode->fSuccessfullyConnected &&
+            (pnode->nStartingHeight > (nBestHeight - 144)) &&
+            (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)) {
+
+			//first select unused node, maybe it's quicker to download
+			if(!pnode->bUsed)
+			{
+				pnodeNewSync = pnode;
+				break;
+			}
+            // if ok, compare node's score with the best so far
+            double dScore = NodeSyncScore(pnode);
+            if (pnodeNewSync == NULL || dScore > dBestScore) {
+                pnodeNewSync = pnode;
+                dBestScore = dScore;
+            }
+        }
+    }
+    // if a new sync candidate was found, start sync!
+    if (pnodeNewSync) {
+        pnodeNewSync->fStartSync = true;
+        pnodeSync = pnodeNewSync;
+		pnodeNewSync->nSyncTime = GetTime();
+		pnodeNewSync->nSyncHeight = nBestHeight;
+		printf("set syncnode:%s, lastspeed:%d, synctime:%"PRI64d", used:%d\n", 
+			pnodeSync->addr.ToString().c_str(), pnodeSync->nSpeed, pnodeSync->nSyncTime, pnodeSync->bUsed);
+		pnodeNewSync->bUsed = true;
+    }
+}
 
 
 
@@ -1673,13 +1917,137 @@ void ThreadMessageHandler2(void* parg)
     SetThreadPriority(THREAD_PRIORITY_BELOW_NORMAL);
     while (!fShutdown)
     {
-        vector<CNode*> vNodesCopy;
+        /*vector<CNode*> vNodesCopy;
         {
             LOCK(cs_vNodes);
             vNodesCopy = vNodes;
             BOOST_FOREACH(CNode* pnode, vNodesCopy)
                 pnode->AddRef();
+        }*/
+
+		
+        bool fHaveSyncNode = false;
+
+		//check nodesync timeout
+		if(NULL != pnodeSync)
+		{
+          	if( pnodeSync->nSyncLastCheckTime > 0)
+		  	{
+				int uDifTime = GetTime() - pnodeSync->nSyncLastCheckTime;
+				int uDifHeight = nBestHeight - pnodeSync->nSyncLastHeight;
+				if(uDifTime > nSyncTimer)//it's time to check
+				{
+					//update speed
+					int uLastSpeed = pnodeSync->nSpeed;
+					pnodeSync->nSpeed = (pnodeSync->nSpeed + (uDifHeight / uDifTime)) / 2;
+					
+					if(pnodeSync->nSpeed <= 0)
+					{
+						pnodeSync->fDisconnect = true;
+						printf("sync timeout, disconnect node:%s\n", pnodeSync->addr.ToString().c_str());
+					}
+
+					if(uDifHeight <= nSyncThreshold)//at least sync 3000 blocks in one minute
+					{
+						//check other node
+						int nMaxSpeed = 0;
+						bool fHasBetter = false;
+						vector<CNode*> vNodesCopy;
+						{
+							LOCK(cs_vNodes);
+							vNodesCopy = vNodes;
+							BOOST_FOREACH(CNode* pnode, vNodesCopy)
+							{
+								if(!pnode->bUsed)
+								{
+									fHasBetter = true;
+									break;
+								}
+
+								if(pnode->nSpeed > nMaxSpeed)
+								{
+									nMaxSpeed = pnode->nSpeed;
+								}
+							}
+						}
+
+						int nCurrentSpeed = pnodeSync->nSpeed;
+						if(nCurrentSpeed < nMaxSpeed)
+						{
+							fHasBetter = true;
+						}
+
+						if(fHasBetter)
+						{
+							//disconnect pending node, reconnect other node to resume download
+							printf("sync timeout, reset syncnode, last syncnode:%s, diftime:%d, last sync count:%d, syncthreshold:%d, speed:%d\n", 
+								pnodeSync->addr.ToString().c_str(), uDifTime, uDifHeight, nSyncThreshold, pnodeSync->nSpeed);
+
+							pnodeSync->fStartSync = false;
+							pnodeSync->nSyncTime = 0;
+							pnodeSync->nSyncHeight = 0;
+							pnodeSync->nSyncLastCheckTime = 0;
+							pnodeSync->nSyncLastHeight = 0;
+							
+							//SaveToSyncMap(pnodeSync);
+							pnodeLastSync = pnodeSync;
+							//reset
+							pnodeSync->fReset = true;
+
+							pnodeSync = NULL;
+						}
+						else
+						{
+							//disconnect pending node, reconnect other node to resume download
+							printf("sync timeout, continue to sync, last syncnode:%s, diftime:%d, last sync count:%d, syncthreshold:%d, speed:%d\n", 
+								pnodeSync->addr.ToString().c_str(), uDifTime, uDifHeight, nSyncThreshold, pnodeSync->nSpeed);
+							//record current height to check whether node is in download pending later
+							pnodeSync->nSyncHeight = nBestHeight;
+							pnodeSync->nSyncLastCheckTime = pnodeSync->nSyncTime;
+							pnodeSync->nSyncLastHeight = nBestHeight;
+							
+						}
+					}
+					else
+					{
+						//record current height to check whether node is in download pending later
+						pnodeSync->nSyncHeight = nBestHeight;
+						pnodeSync->nSyncLastCheckTime = pnodeSync->nSyncTime;
+						pnodeSync->nSyncLastHeight = nBestHeight;
+					}
+
+				}
+				else
+				{
+					//no need to check when time elapse below 60 seconds
+				}
+			 }
+			 else
+			 {
+			 	pnodeSync->nSyncLastCheckTime = pnodeSync->nSyncTime;
+				pnodeSync->nSyncLastHeight = pnodeSync->nSyncHeight;
+			 }
+		 }
+		 else
+		 {
+				//synced or no connection to sync
+		 }
+
+        vector<CNode*> vNodesCopy;
+        {
+            LOCK(cs_vNodes);
+            vNodesCopy = vNodes;
+            BOOST_FOREACH(CNode* pnode, vNodesCopy) {
+                pnode->AddRef();
+                if ((NULL != pnodeSync) && (pnode == pnodeSync))
+                {
+                    fHaveSyncNode = true;
+                }
+            }
         }
+
+        if (!fHaveSyncNode)
+            StartSync(vNodesCopy);
 
         // Poll the connected nodes for messages
         CNode* pnodeTrickle = NULL;
@@ -1798,7 +2166,7 @@ bool BindListenPort(const CService &addrBind, string& strError)
     // and enable it by default or not. Try to enable it, if possible.
     if (addrBind.IsIPv6()) {
 #ifdef IPV6_V6ONLY
-        setsockopt(hListenSocket, IPPROTO_IPV6, IPV6_V6ONLY, (void*)&nOne, sizeof(int));
+        setsockopt(hListenSocket, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&nOne, sizeof(int));
 #endif
 #ifdef WIN32
         int nProtLevel = 10 /* PROTECTION_LEVEL_UNRESTRICTED */;
@@ -2026,3 +2394,44 @@ public:
     }
 }
 instance_of_cnetcleanup;
+
+void RelayTransaction(const CTransaction& tx, const uint256& hash)
+{
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss.reserve(10000);
+    ss << tx;
+    RelayTransaction(tx, hash, ss);
+}
+
+void RelayTransaction(const CTransaction& tx, const uint256& hash, const CDataStream& ss)
+{
+    CInv inv(MSG_TX, hash);
+    {
+        LOCK(cs_mapRelay);
+        // Expire old relay messages
+        while (!vRelayExpiration.empty() && vRelayExpiration.front().first < GetTime())
+        {
+            mapRelay.erase(vRelayExpiration.front().second);
+            vRelayExpiration.pop_front();
+        }
+
+        // Save original serialized message so newer versions are preserved
+        mapRelay.insert(std::make_pair(inv, ss));
+        vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, inv));
+    }
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if(!pnode->fRelayTxes)
+            continue;
+        LOCK(pnode->cs_filter);
+        if (pnode->pfilter)
+        {
+            if (pnode->pfilter->IsRelevantAndUpdate(tx, hash))
+                pnode->PushInventory(inv);
+        } else
+            pnode->PushInventory(inv);
+    }
+}
+
+

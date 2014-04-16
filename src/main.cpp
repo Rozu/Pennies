@@ -72,6 +72,9 @@ int64 nHPSTimerStart;
 // Settings
 int64 nTransactionFee = MIN_TX_FEE;
 
+extern CNode* pnodeSync;
+extern CNode* pnodeLastSync;
+
 
 //////////////////////////////////////////////////////////////////////////////
 //
@@ -970,7 +973,7 @@ unsigned char GetNfactor(int64 nTimestamp) {
     if (n < 0) n = 0;
 
     if (n > 255)
-        printf( "GetNfactor(%lld) - something wrong(n == %d)\n", nTimestamp, n );
+        printf( "GetNfactor(%"PRI64d") - something wrong(n == %d)\n", nTimestamp, n );
 
     unsigned char N = (unsigned char) n;
     //printf("GetNfactor: %d -> %d %d : %d / %d\n", nTimestamp - nChainStartTime, l, s, n, min(max(N, minNfactor), maxNfactor));
@@ -2120,9 +2123,13 @@ bool CBlock::AcceptBlock()
     if (!Checkpoints::CheckHardened(nHeight, hash))
         return DoS(100, error("AcceptBlock() : rejected by hardened checkpoint lock-in at %d", nHeight));
 
-    // ppcoin: check that the block satisfies synchronized checkpoint
-    if (!Checkpoints::CheckSync(hash, pindexPrev))
-        return error("AcceptBlock() : rejected by synchronized checkpoint");
+    //no need to checksync every block when it's in block downloading, checksync will slowdown downloading process
+    if (!IsInitialBlockDownload())
+    {
+	    // ppcoin: check that the block satisfies synchronized checkpoint
+	    if (!Checkpoints::CheckSync(hash, pindexPrev))
+	        return error("AcceptBlock() : rejected by synchronized checkpoint");
+    }
 
     // Reject block.nVersion < 3 blocks since 95% threshold on mainNet and always on testNet:
     // DIFF: will use only nVersion > 3
@@ -2195,8 +2202,41 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     if (pblock->IsProofOfStake())
     {
         uint256 hashProofOfStake = 0;
-        if (!CheckProofOfStake(pblock->vtx[1], pblock->nBits, hashProofOfStake))
+		int iRet = CheckProofOfStake( pblock->vtx[1], pblock->nBits, hashProofOfStake);
+        if (1 != iRet)
         {
+           if(2 == iRet){
+		   	
+			// If don't already have its previous block, shunt it off to holding area until we get it
+			if (!mapBlockIndex.count(pblock->hashPrevBlock))
+			{
+				printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().substr(0,20).c_str());
+				CBlock* pblock2 = new CBlock(*pblock);
+				// ppcoin: check proof-of-stake
+				if (pblock2->IsProofOfStake())
+				{
+					// Limited duplicity on stake: prevents block flood attack
+					// Duplicate stake allowed only when there is orphan child block
+					if (setStakeSeenOrphan.count(pblock2->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
+						return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for orphan block %s", pblock2->GetProofOfStake().first.ToString().c_str(), pblock2->GetProofOfStake().second, hash.ToString().c_str());
+					else
+						setStakeSeenOrphan.insert(pblock2->GetProofOfStake());
+				}
+				mapOrphanBlocks.insert(make_pair(hash, pblock2));
+				mapOrphanBlocksByPrev.insert(make_pair(pblock2->hashPrevBlock, pblock2));
+			
+				// Ask this guy to fill in what we're missing
+				if (pfrom)
+				{
+					pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
+					// ppcoin: getblocks may not obtain the ancestor block rejected
+					// earlier by duplicate-stake check so we ask for it again directly
+					if (!IsInitialBlockDownload())
+						pfrom->AskFor(CInv(MSG_BLOCK, WantedByOrphan(pblock2)));
+				}
+				//return true;
+			}
+           	}
             printf("WARNING: ProcessBlock(): check proof-of-stake failed for block %s\n", hash.ToString().c_str());
             return false; // do not error here as we expect this during initial block download
         }
@@ -2270,6 +2310,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
              ++mi)
         {
             CBlock* pblockOrphan = (*mi).second;
+			 printf("ProcessOrphanBlock, hash:%s\n", pblockOrphan->GetHash().ToString().substr(0,20).c_str());
             if (pblockOrphan->AcceptBlock())
                 vWorkQueue.push_back(pblockOrphan->GetHash());
             mapOrphanBlocks.erase(pblockOrphan->GetHash());
@@ -2279,7 +2320,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         mapOrphanBlocksByPrev.erase(hashPrev);
     }
 
-    printf("ProcessBlock: ACCEPTED\n");
+    printf("ProcessBlock: ACCEPTED, hash:%s\n", pblock->GetHash().ToString().substr(0,20).c_str());
 
     // ppcoin: if responsible for sync-checkpoint send it
     if (pfrom && !CSyncCheckpoint::strMasterPrivKey.empty())
@@ -2287,6 +2328,34 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 
     return true;
 }
+
+
+CMerkleBlock::CMerkleBlock(const CBlock& block, CBloomFilter& filter)
+{
+    header = block.GetBlockHeader();
+
+    vector<bool> vMatch;
+    vector<uint256> vHashes;
+
+    vMatch.reserve(block.vtx.size());
+    vHashes.reserve(block.vtx.size());
+
+    for (unsigned int i = 0; i < block.vtx.size(); i++)
+    {
+        uint256 hash = block.vtx[i].GetHash();
+        if (filter.IsRelevantAndUpdate(block.vtx[i], hash))
+        {
+            vMatch.push_back(true);
+            vMatchedTxn.push_back(make_pair(i, hash));
+        }
+        else
+            vMatch.push_back(false);
+        vHashes.push_back(hash);
+    }
+
+    txn = CPartialMerkleTree(vHashes, vMatch);
+}
+
 
 // ppcoin: sign block
 bool CBlock::SignBlock(const CKeyStore& keystore)
@@ -2399,6 +2468,122 @@ bool CBlock::CheckBlockSignature() const
     }
     return false;
 }
+
+uint256 CPartialMerkleTree::CalcHash(int height, unsigned int pos, const std::vector<uint256> &vTxid) {
+    if (height == 0) {
+        // hash at height 0 is the txids themself
+        return vTxid[pos];
+    } else {
+        // calculate left hash
+        uint256 left = CalcHash(height-1, pos*2, vTxid), right;
+        // calculate right hash if not beyong the end of the array - copy left hash otherwise1
+        if (pos*2+1 < CalcTreeWidth(height-1))
+            right = CalcHash(height-1, pos*2+1, vTxid);
+        else
+            right = left;
+        // combine subhashes
+        return Hash(BEGIN(left), END(left), BEGIN(right), END(right));
+    }
+}
+
+void CPartialMerkleTree::TraverseAndBuild(int height, unsigned int pos, const std::vector<uint256> &vTxid, const std::vector<bool> &vMatch) {
+    // determine whether this node is the parent of at least one matched txid
+    bool fParentOfMatch = false;
+    for (unsigned int p = pos << height; p < (pos+1) << height && p < nTransactions; p++)
+        fParentOfMatch |= vMatch[p];
+    // store as flag bit
+    vBits.push_back(fParentOfMatch);
+    if (height==0 || !fParentOfMatch) {
+        // if at height 0, or nothing interesting below, store hash and stop
+        vHash.push_back(CalcHash(height, pos, vTxid));
+    } else {
+        // otherwise, don't store any hash, but descend into the subtrees
+        TraverseAndBuild(height-1, pos*2, vTxid, vMatch);
+        if (pos*2+1 < CalcTreeWidth(height-1))
+            TraverseAndBuild(height-1, pos*2+1, vTxid, vMatch);
+    }
+}
+
+uint256 CPartialMerkleTree::TraverseAndExtract(int height, unsigned int pos, unsigned int &nBitsUsed, unsigned int &nHashUsed, std::vector<uint256> &vMatch) {
+    if (nBitsUsed >= vBits.size()) {
+        // overflowed the bits array - failure
+        fBad = true;
+        return 0;
+    }
+    bool fParentOfMatch = vBits[nBitsUsed++];
+    if (height==0 || !fParentOfMatch) {
+        // if at height 0, or nothing interesting below, use stored hash and do not descend
+        if (nHashUsed >= vHash.size()) {
+            // overflowed the hash array - failure
+            fBad = true;
+            return 0;
+        }
+        const uint256 &hash = vHash[nHashUsed++];
+        if (height==0 && fParentOfMatch) // in case of height 0, we have a matched txid
+            vMatch.push_back(hash);
+        return hash;
+    } else {
+        // otherwise, descend into the subtrees to extract matched txids and hashes
+        uint256 left = TraverseAndExtract(height-1, pos*2, nBitsUsed, nHashUsed, vMatch), right;
+        if (pos*2+1 < CalcTreeWidth(height-1))
+            right = TraverseAndExtract(height-1, pos*2+1, nBitsUsed, nHashUsed, vMatch);
+        else
+            right = left;
+        // and combine them before returning
+        return Hash(BEGIN(left), END(left), BEGIN(right), END(right));
+    }
+}
+
+CPartialMerkleTree::CPartialMerkleTree(const std::vector<uint256> &vTxid, const std::vector<bool> &vMatch) : nTransactions(vTxid.size()), fBad(false) {
+    // reset state
+    vBits.clear();
+    vHash.clear();
+
+    // calculate height of tree
+    int nHeight = 0;
+    while (CalcTreeWidth(nHeight) > 1)
+        nHeight++;
+
+    // traverse the partial tree
+    TraverseAndBuild(nHeight, 0, vTxid, vMatch);
+}
+
+CPartialMerkleTree::CPartialMerkleTree() : nTransactions(0), fBad(true) {}
+
+uint256 CPartialMerkleTree::ExtractMatches(std::vector<uint256> &vMatch) {
+    vMatch.clear();
+    // An empty set will not work
+    if (nTransactions == 0)
+        return 0;
+    // check for excessively high numbers of transactions
+    if (nTransactions > MAX_BLOCK_SIZE / 60) // 60 is the lower bound for the size of a serialized CTransaction
+        return 0;
+    // there can never be more hashes provided than one for every txid
+    if (vHash.size() > nTransactions)
+        return 0;
+    // there must be at least one bit per node in the partial tree, and at least one node per hash
+    if (vBits.size() < vHash.size())
+        return 0;
+    // calculate height of tree
+    int nHeight = 0;
+    while (CalcTreeWidth(nHeight) > 1)
+        nHeight++;
+    // traverse the partial tree
+    unsigned int nBitsUsed = 0, nHashUsed = 0;
+    uint256 hashMerkleRoot = TraverseAndExtract(nHeight, 0, nBitsUsed, nHashUsed, vMatch);
+    // verify that no problems occured during the tree traversal
+    if (fBad)
+        return 0;
+    // verify that all bits were consumed (except for the padding caused by serializing it as a byte sequence)
+    if ((nBitsUsed+7)/8 != (vBits.size()+7)/8)
+        return 0;
+    // verify that all hashes were consumed
+    if (nHashUsed != vHash.size())
+        return 0;
+    return hashMerkleRoot;
+}
+
+
 
 bool CheckDiskSpace(uint64 nAdditionalBytes)
 {
@@ -2523,6 +2708,7 @@ bool LoadBlockIndex(bool fAllowNew)
         //// debug print
         printf("block.GetHash() == %s\n", block.GetHash().ToString().c_str());
         printf("block.hashMerkleRoot == %s\n", block.hashMerkleRoot.ToString().c_str());
+        printf("block.nBits = %u \n", block.nBits);
         printf("block.nNonce = %u \n", block.nNonce);
         assert(block.hashMerkleRoot == uint256("0xf7ffaccb83f13c0a4dc8d852de2254da7b2b63623b38c0ad4afd1d606045f1f4"));
         block.print();
@@ -2820,6 +3006,145 @@ bool static AlreadyHave(CTxDB& txdb, const CInv& inv)
 }
 
 
+void static ProcessGetData(CNode* pfrom)
+{
+    std::deque<CInv>::iterator it = pfrom->vRecvGetData.begin();
+
+    vector<CInv> vNotFound;
+
+    LOCK(cs_main);
+
+    while (it != pfrom->vRecvGetData.end()) {
+        // Don't bother if send buffer is too full to respond anyway
+        if (pfrom->nSendSize >= SendBufferSize())
+            break;
+
+        const CInv &inv = *it;
+        {
+            boost::this_thread::interruption_point();
+            it++;
+
+            if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
+            {
+                bool send = false;
+                map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(inv.hash);
+                if (mi != mapBlockIndex.end())
+                {
+                    /*// If the requested block is at a height below our last
+                    // checkpoint, only serve it if it's in the checkpointed chain
+                    int nHeight = mi->second->nHeight;
+                    CBlockIndex* pcheckpoint = Checkpoints::GetLastCheckpoint(mapBlockIndex);
+                    if (pcheckpoint && nHeight < pcheckpoint->nHeight) {
+                       if (!chainActive.Contains(mi->second))
+                       {
+                         //LogPrintf("ProcessGetData(): ignoring request for old block that isn't in the main chain\n");
+                       } else {
+                         send = true;
+                       }
+                    } else {
+                      send = true;
+                    }*/
+					send = true;
+                }
+                if (send)
+                {
+                    // Send block from disk
+                    
+					CBlock block;
+					block.ReadFromDisk((*mi).second);
+                    if (inv.type == MSG_BLOCK)
+                        pfrom->PushMessage("block", block);
+                    else // MSG_FILTERED_BLOCK)
+                    {
+                        LOCK(pfrom->cs_filter);
+                        if (pfrom->pfilter)
+                        {
+                            CMerkleBlock merkleBlock(block, *pfrom->pfilter);
+                            pfrom->PushMessage("merkleblock", merkleBlock);
+                            // CMerkleBlock just contains hashes, so also push any transactions in the block the client did not see
+                            // This avoids hurting performance by pointlessly requiring a round-trip
+                            // Note that there is currently no way for a node to request any single transactions we didnt send here -
+                            // they must either disconnect and retry or request the full block.
+                            // Thus, the protocol spec specified allows for us to provide duplicate txn here,
+                            // however we MUST always provide at least what the remote peer needs
+                            typedef std::pair<unsigned int, uint256> PairType;
+                            BOOST_FOREACH(PairType& pair, merkleBlock.vMatchedTxn)
+                                if (!pfrom->setInventoryKnown.count(CInv(MSG_TX, pair.second)))
+                                    pfrom->PushMessage("tx", block.vtx[pair.first]);
+                         }
+                         // else
+                            // no response
+                      }
+
+                    // Trigger them to send a getblocks request for the next batch of inventory
+                    if (inv.hash == pfrom->hashContinue)
+                    {
+                        // Bypass PushInventory, this must send even if redundant,
+                        // and we want it right after the last block so they don't
+                        // wait for other stuff first.
+                        vector<CInv> vInv;
+                        //vInv.push_back(CInv(MSG_BLOCK, chainActive.Tip()->GetBlockHash()));
+                        vInv.push_back(CInv(MSG_BLOCK, hashBestChain));                        
+                        pfrom->PushMessage("inv", vInv);
+                        pfrom->hashContinue = 0;
+                    }
+                }
+            }//if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
+            else if (inv.IsKnownType())
+            {
+                // Send stream from relay memory
+                bool pushed = false;
+                {
+                    LOCK(cs_mapRelay);
+                    map<CInv, CDataStream>::iterator mi = mapRelay.find(inv);
+                    if (mi != mapRelay.end()) {
+                        pfrom->PushMessage(inv.GetCommand(), (*mi).second);
+                        pushed = true;
+                    }
+                }
+                if (!pushed && inv.type == MSG_TX) {
+                    CTransaction tx;
+					if(mempool.exists(inv.hash)) {
+                   // if (mempool.lookup(inv.hash, tx)) {
+				   		tx = mempool.lookup(inv.hash);
+                        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+                        ss.reserve(1000);
+                        ss << tx;
+                        pfrom->PushMessage("tx", ss);
+                        pushed = true;
+                    }
+                }
+                if (!pushed) {
+                    vNotFound.push_back(inv);
+                }
+            }//else if(inv.IsKownType())
+            else{
+					printf("processgetdata, unkowntype\n");
+            	}
+
+            // Track requests for our stuff.
+            //g_signals.Inventory(inv.hash);
+
+           // if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
+           //     break;
+        }//const CInv
+    }//end while
+
+    pfrom->vRecvGetData.erase(pfrom->vRecvGetData.begin(), it);
+
+    if (!vNotFound.empty()) {
+        // Let the peer know that we didn't find what it asked for, so it doesn't
+        // have to wait around forever. Currently only SPV clients actually care
+        // about this message: it's needed when they are recursively walking the
+        // dependencies of relevant unconfirmed transactions. SPV clients want to
+        // do that because they want to know about (and store and rebroadcast and
+        // risk analyze) the dependencies of transactions relevant to them, without
+        // having to download the entire memory pool.
+        pfrom->PushMessage("notfound", vNotFound);
+    }
+}
+
+
 
 
 // The message start string is designed to be unlikely to occur in normal data.
@@ -2832,7 +3157,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     static map<CService, CPubKey> mapReuseKey;
     RandAddSeedPerfmon();
     if (fDebug)
-        printf("received: %s (%"PRIszu" bytes)\n", strCommand.c_str(), vRecv.size());
+        printf("received: %s (%"PRIszu" bytes), from:%s, current height:%d\n", strCommand.c_str(), vRecv.size(), pfrom->addr.ToString().c_str(), nBestHeight);
     if (mapArgs.count("-dropmessagestest") && GetRand(atoi(mapArgs["-dropmessagestest"])) == 0)
     {
         printf("dropmessagestest DROPPING RECV MESSAGE\n");
@@ -2888,6 +3213,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             vRecv >> pfrom->strSubVer;
         if (!vRecv.empty())
             vRecv >> pfrom->nStartingHeight;
+        if (!vRecv.empty())
+            vRecv >> pfrom->fRelayTxes; // set to true after we get the first filter* message
+        else
+            pfrom->fRelayTxes = true;
 
         if (pfrom->fInbound && addrMe.IsRoutable())
         {
@@ -2945,7 +3274,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         }
 
         // Ask the first connected node for block updates
-        static int nAskedForBlocks = 0;
+        /*static int nAskedForBlocks = 0;
 
         if (!pfrom->fClient && !pfrom->fOneShot &&
             (pfrom->nStartingHeight > (nBestHeight - 144)) &&
@@ -2955,7 +3284,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         {
             nAskedForBlocks++;
             pfrom->PushGetBlocks(pindexBest, uint256(0));
-        }
+        }*/
         
         // Relay alerts
         {
@@ -3074,6 +3403,19 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             return error("message inv size() = %"PRIszu"", vInv.size());
         }
 
+		CNode* pnode = getNodeSync();
+		if(pnode != NULL && pfrom != pnode)
+		{
+			return error("receive inv msg from ip:%s, but it's not the sync node:%s", 
+				pfrom->addr.ToString().c_str(), pnode->addr.ToString().c_str());
+		}
+
+		if(pnode != NULL){
+			pnode->nSyncTime = GetTime();
+			pnode->nSyncHeight = nBestHeight;
+			printf("ip:%s, reset synctime:%"PRI64d", current height:%d\n", pnode->addr.ToString().c_str(), pnode->nSyncTime , pnode->nSyncHeight);
+		}
+
         // find last block in inv vector
         unsigned int nLastBlock = (unsigned int)(-1);
         for (unsigned int nInv = 0; nInv < vInv.size(); nInv++) {
@@ -3127,7 +3469,15 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         if (fDebugNet || (vInv.size() != 1))
             printf("received getdata (%"PRIszu" invsz)\n", vInv.size());
 
-        BOOST_FOREACH(const CInv& inv, vInv)
+		
+		CNode* pnode = getNodeSync();
+		if(pnode != NULL && pnode->fStartSync)
+		{
+			return error("receive getdata msg from ip:%s, ignore it because i'm syncing", 
+				pfrom->addr.ToString().c_str());
+		}
+
+        /*BOOST_FOREACH(const CInv& inv, vInv)
         {
             if (fShutdown)
                 return true;
@@ -3183,7 +3533,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
             // Track requests for our stuff
             Inventory(inv.hash);
-        }
+        }*/
+        pfrom->vRecvGetData.insert(pfrom->vRecvGetData.end(), vInv.begin(), vInv.end());
+		ProcessGetData(pfrom);
     }
 
 
@@ -3201,7 +3553,15 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             pindex = pindex->pnext;
         int nLimit = 500;
         printf("getblocks %d to %s limit %d\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,20).c_str(), nLimit);
-        for (; pindex; pindex = pindex->pnext)
+
+		CNode* pnode = getNodeSync();
+		if(pnode != NULL && pnode->fStartSync)
+		{
+			return error("receive getblocks msg from ip:%s, ignore it because i'm syncing", 
+				pfrom->addr.ToString().c_str());
+		}
+
+		for (; pindex; pindex = pindex->pnext)
         {
             if (pindex->GetBlockHash() == hashStop)
             {
@@ -3261,12 +3621,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                 pindex = pindex->pnext;
         }
 
-        vector<CBlock> vHeaders;
+		// we must use CLightWalletBlock, as CBlockHeaders won't include the 0x00 nTx count at the end
+        vector<CLightWalletBlock> vHeaders;
         int nLimit = 2000;
         printf("getheaders %d to %s\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,20).c_str());
         for (; pindex; pindex = pindex->pnext)
         {
-            vHeaders.push_back(pindex->GetBlockHeader());
+            vHeaders.push_back(pindex->GetBlockHeader().GetBlockHeader());
             if (--nLimit <= 0 || pindex->GetBlockHash() == hashStop)
                 break;
         }
@@ -3290,7 +3651,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         if (tx.AcceptToMemoryPool(txdb, true, &fMissingInputs))
         {
             SyncWithWallets(tx, NULL, true);
-            RelayMessage(inv, vMsg);
+            //RelayMessage(inv, vMsg);
+            RelayTransaction(tx, inv.hash);
             mapAlreadyAskedFor.erase(inv);
             vWorkQueue.push_back(inv.hash);
             vEraseQueue.push_back(inv.hash);
@@ -3313,7 +3675,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                     {
                         printf("   accepted orphan tx %s\n", inv.hash.ToString().substr(0,10).c_str());
                         SyncWithWallets(tx, NULL, true);
-                        RelayMessage(inv, vMsg);
+                        //RelayMessage(inv, vMsg);
+                        RelayTransaction(tx, inv.hash);
                         mapAlreadyAskedFor.erase(inv);
                         vWorkQueue.push_back(inv.hash);
                         vEraseQueue.push_back(inv.hash);
@@ -3348,9 +3711,23 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         CBlock block;
         vRecv >> block;
 
-        printf("received block %s\n", block.GetHash().ToString().substr(0,20).c_str());
+        printf("received block %s\n", block.GetHash().ToString().c_str());
         // block.print();
 
+		
+		CNode* pnode = getNodeSync();
+		if(pnode != NULL && pfrom != pnode)
+		{
+			return error("receive block msg from ip:%s, but it's not the sync node:%s", 
+				pfrom->addr.ToString().c_str(), pnode->addr.ToString().c_str());
+		}
+
+		if(pnode != NULL){
+			pnode->nSyncTime = GetTime();
+			pnode->nSyncHeight = nBestHeight;
+			printf("ip:%s, reset synctime:%"PRI64d", current height:%d\n", pnode->addr.ToString().c_str(), pnode->nSyncTime , pnode->nSyncHeight);
+		}
+		
         CInv inv(MSG_BLOCK, block.GetHash());
         pfrom->AddInventoryKnown(inv);
 
@@ -3371,17 +3748,27 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
     else if (strCommand == "mempool")
     {
+        LOCK2(cs_main, pfrom->cs_filter);
+
         std::vector<uint256> vtxid;
         mempool.queryHashes(vtxid);
         vector<CInv> vInv;
-        for (unsigned int i = 0; i < vtxid.size(); i++) {
-            CInv inv(MSG_TX, vtxid[i]);
-            vInv.push_back(inv);
-            if (i == (MAX_INV_SZ - 1))
-                    break;
+        BOOST_FOREACH(uint256& hash, vtxid) {
+            CInv inv(MSG_TX, hash);
+            CTransaction tx;
+            bool fInMemPool = false;//mempool.lookup(hash, tx);
+            if (!fInMemPool) continue; // another thread removed since queryHashes, maybe...
+            if ((pfrom->pfilter && pfrom->pfilter->IsRelevantAndUpdate(tx, hash)) ||
+               (!pfrom->pfilter))
+                vInv.push_back(inv);
+            if (vInv.size() == MAX_INV_SZ) {
+                pfrom->PushMessage("inv", vInv);
+				                vInv.clear();
+            }
         }
         if (vInv.size() > 0)
             pfrom->PushMessage("inv", vInv);
+
     }
 
 
@@ -3459,6 +3846,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         CAlert alert;
         vRecv >> alert;
 
+		printf("alert received:\n%s\n", alert.ToString().c_str());
+
         uint256 alertHash = alert.GetHash();
         if (pfrom->setKnown.count(alertHash) == 0)
         {
@@ -3484,7 +3873,71 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         }
     }
 
+    else if (strCommand == "filterload")
+    {
+        CBloomFilter filter;
+        vRecv >> filter;
 
+        if (!filter.IsWithinSizeConstraints())
+            // There is no excuse for sending a too-large filter
+            pfrom->Misbehaving(/*pfrom->GetId(),*/ 100);
+        else
+        {
+            LOCK(pfrom->cs_filter);
+            delete pfrom->pfilter;
+            pfrom->pfilter = new CBloomFilter(filter);
+            pfrom->pfilter->UpdateEmptyFull();
+        }
+        pfrom->fRelayTxes = true;
+    }
+
+    else if (strCommand == "filteradd")
+    {
+        vector<unsigned char> vData;
+        vRecv >> vData;
+
+        // Nodes must NEVER send a data item > 520 bytes (the max size for a script data object,
+        // and thus, the maximum size any matched object can have) in a filteradd message
+        if (vData.size() > MAX_SCRIPT_ELEMENT_SIZE)
+        {
+            pfrom->Misbehaving(/*pfrom->GetId(),*/ 100);
+        } else {
+            LOCK(pfrom->cs_filter);
+            if (pfrom->pfilter)
+                pfrom->pfilter->insert(vData);
+            else
+                pfrom->Misbehaving(/*pfrom->GetId(),*/ 100);
+        }
+    }
+    else if (strCommand == "filterclear")
+    {
+        LOCK(pfrom->cs_filter);
+        delete pfrom->pfilter;
+        pfrom->pfilter = new CBloomFilter();
+        pfrom->fRelayTxes = true;
+    }
+    else if (strCommand == "reject")
+    {
+        if (fDebug)
+        {
+            string strMsg; unsigned char ccode; string strReason;
+            vRecv >> strMsg >> ccode >> strReason;
+
+            ostringstream ss;
+            ss << strMsg << " code " << itostr(ccode) << ": " << strReason;
+
+            if (strMsg == "block" || strMsg == "tx")
+            {
+                uint256 hash;
+                vRecv >> hash;
+                ss << ": hash " << hash.ToString();
+            }
+            // Truncate to reasonable length and sanitize before printing:
+            string s = ss.str();
+            if (s.size() > 111) s.erase(111, string::npos);
+            //printf("net", "Reject %s\n", SanitizeString(s));
+        }
+    }
     else
     {
         // Ignore unknown commands for extensibility
@@ -3691,6 +4144,28 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             pto->vAddrToSend.clear();
             if (!vAddr.empty())
                 pto->PushMessage("addr", vAddr);
+        }
+
+        // Start block sync
+        if (pto->fStartSync) {
+            pto->fStartSync = false;
+			
+			if(pnodeSync == pnodeLastSync)
+			{
+				//still need to clear the map
+				//clear previous askfor map
+				mapAlreadyAskedFor.clear();
+			}
+			else
+			{
+				//clear previous askfor map
+				mapAlreadyAskedFor.clear();
+			}
+			
+            pto->PushGetBlocks(pindexBest, uint256(0));
+			printf("send getblocks to ip:%s, start hash:%s, end:0\n", 
+				pto->addr.ToString().c_str(), 
+				pindexBest != NULL ? pindexBest->GetBlockHash().ToString().c_str() : "0");
         }
 
 
@@ -4001,7 +4476,7 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake)
                     if (!mempool.mapTx.count(txin.prevout.hash))
                     {
                         printf("ERROR: mempool transaction missing input\n");
-                        if (fDebug) assert("mempool transaction missing input" == 0);
+                        //if (fDebug) assert("mempool transaction missing input" == 0);
                         fMissingInputs = true;
                         if (porphan)
                             vOrphan.pop_back();

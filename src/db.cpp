@@ -830,6 +830,7 @@ bool CTxDB::LoadBlockIndexGuts()
 
     // Load mapBlockIndex
     unsigned int fFlags = DB_SET_RANGE;
+	int i = 0;
     loop
     {
         // Read next record
@@ -839,10 +840,14 @@ bool CTxDB::LoadBlockIndexGuts()
         CDataStream ssValue(SER_DISK, CLIENT_VERSION);
         int ret = ReadAtCursor(pcursor, ssKey, ssValue, fFlags);
         fFlags = DB_NEXT;
-        if (ret == DB_NOTFOUND)
+        if (ret == DB_NOTFOUND){
+			error("LoadBlockIndexGuts, DB_NOTFOUND, i:%d.\n",i);
             break;
-        else if (ret != 0)
+        }
+        else if (ret != 0){
+			error("LoadBlockIndexGuts, ret:%d, i:%d\n",ret, i);
             return false;
+        }
 
         // Unserialize
 
@@ -853,6 +858,17 @@ bool CTxDB::LoadBlockIndexGuts()
         {
             CDiskBlockIndex diskindex;
             ssValue >> diskindex;
+
+			i++;
+			if(0 == diskindex.GetBlockHash())
+			{
+				error("LoadBlockIndexGuts, i:%d, hash:%s, hash = 0.\n",i, diskindex.GetBlockHash().ToString().substr(0,20).c_str());
+				continue;
+			}
+			
+			if(i % 10000 == 0){
+				printf("LoadBlockIndexGuts, i:%d, hash:%s\n",i, diskindex.GetBlockHash().ToString().substr(0,20).c_str());
+			}
 
             // Construct block index object
             CBlockIndex* pindexNew = InsertBlockIndex(diskindex.GetBlockHash());

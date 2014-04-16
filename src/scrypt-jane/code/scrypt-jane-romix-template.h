@@ -57,6 +57,10 @@ SCRYPT_CHUNKMIX_FN(scrypt_mix_word_t *Bout/*[chunkWords]*/, scrypt_mix_word_t *B
 }
 #endif
 
+//debug performance
+#define printf OutputDebugStringF
+
+
 /*
 	X = ROMix(X)
 

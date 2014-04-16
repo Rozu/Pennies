@@ -16,6 +16,8 @@
 class CWallet;
 class CBlock;
 class CBlockIndex;
+class CBlockHeader;
+class CBloomFilter;
 class CKeyItem;
 class CReserveKey;
 class COutPoint;
@@ -411,6 +413,65 @@ public:
     void print() const
     {
         printf("%s\n", ToString().c_str());
+    }
+};
+
+
+/** Nodes collect new transactions into a block, hash them into a hash tree,
+ * and scan through nonce values to make the block's hash satisfy proof-of-work
+ * requirements.  When they solve the proof-of-work, they broadcast the block
+ * to everyone and the block is added to the block chain.  The first transaction
+ * in the block is a special one that creates a new coin owned by the creator
+ * of the block.
+ */
+class CBlockHeader
+{
+public:
+    // header
+    static const int CURRENT_VERSION=4;
+    int nVersion;
+    uint256 hashPrevBlock;
+    uint256 hashMerkleRoot;
+    unsigned int nTime;
+    unsigned int nBits;
+    unsigned int nNonce;
+
+    CBlockHeader()
+    {
+        SetNull();
+    }
+
+    IMPLEMENT_SERIALIZE
+    (
+        READWRITE(this->nVersion);
+        nVersion = this->nVersion;
+        READWRITE(hashPrevBlock);
+        READWRITE(hashMerkleRoot);
+        READWRITE(nTime);
+        READWRITE(nBits);
+        READWRITE(nNonce);
+    )
+
+    void SetNull()
+    {
+        nVersion = CBlockHeader::CURRENT_VERSION;
+        hashPrevBlock = 0;
+        hashMerkleRoot = 0;
+        nTime = 0;
+        nBits = 0;
+        nNonce = 0;
+    }
+
+    bool IsNull() const
+    {
+        return (nBits == 0);
+    }
+
+    uint256 GetHash() const;
+
+    int64_t GetBlockTime() const
+    {
+        return (int64_t)nTime;
     }
 };
 
@@ -821,6 +882,102 @@ public:
 
 
 
+/** Nodes collect new transactions into a block, hash them into a hash tree,
+ * and scan through nonce values to make the block's hash satisfy proof-of-work
+ * requirements.  When they solve the proof-of-work, they broadcast the block
+ * to everyone and the block is added to the block chain.  The first transaction
+ * in the block is a special one that creates a new coin owned by the creator
+ * of the block.
+ *
+ * Blocks are appended to blk0001.dat files on disk.  Their location on disk
+ * is indexed by CBlockIndex objects in memory.
+ */
+class CLightWalletBlock: public CBlockHeader
+{
+public:
+
+    // network and disk
+    std::vector<CTransaction> vtx;
+
+    // memory only
+    mutable std::vector<uint256> vMerkleTree;
+
+    CLightWalletBlock()
+    {
+        SetNull();
+    }
+
+	CLightWalletBlock(const CBlockHeader &header)
+    {
+        SetNull();
+        *((CBlockHeader*)this) = header;
+    }
+
+    IMPLEMENT_SERIALIZE
+    (
+        READWRITE(this->nVersion);
+        nVersion = this->nVersion;
+        READWRITE(hashPrevBlock);
+        READWRITE(hashMerkleRoot);
+        READWRITE(nTime);
+        READWRITE(nBits);
+        READWRITE(nNonce);
+
+        READWRITE(vtx);
+     )
+
+    void SetNull()
+    {
+        nVersion = CLightWalletBlock::CURRENT_VERSION;
+        hashPrevBlock = 0;
+        hashMerkleRoot = 0;
+        nTime = 0;
+        nBits = 0;
+        nNonce = 0;
+        vtx.clear();
+        vMerkleTree.clear();
+    }
+	
+	CBlockHeader GetBlockHeader() const
+    {
+        CBlockHeader block;
+        block.nVersion       = nVersion;
+        block.hashPrevBlock  = hashPrevBlock;
+        block.hashMerkleRoot = hashMerkleRoot;
+        block.nTime          = nTime;
+        block.nBits          = nBits;
+        block.nNonce         = nNonce;
+        return block;
+    }
+	
+
+    bool IsNull() const
+    {
+        return (nBits == 0);
+    }
+
+    void print() const
+    {
+        printf("CBlock(hash=%s, ver=%d, hashPrevBlock=%s, hashMerkleRoot=%s, nTime=%u, nBits=%08x, nNonce=%u, vtx=%"PRIszu")\n",
+            GetHash().ToString().substr(0,20).c_str(),
+            nVersion,
+            hashPrevBlock.ToString().substr(0,20).c_str(),
+            hashMerkleRoot.ToString().substr(0,10).c_str(),
+            nTime, nBits, nNonce,
+            vtx.size());
+        for (unsigned int i = 0; i < vtx.size(); i++)
+        {
+            printf("  ");
+            vtx[i].print();
+        }
+        printf("  vMerkleTree: ");
+        for (unsigned int i = 0; i < vMerkleTree.size(); i++)
+            printf("%s ", vMerkleTree[i].ToString().substr(0,10).c_str());
+        printf("\n");
+    }
+
+};
+
 
 
 /** Nodes collect new transactions into a block, hash them into a hash tree,
@@ -833,17 +990,17 @@ public:
  * Blocks are appended to blk0001.dat files on disk.  Their location on disk
  * is indexed by CBlockIndex objects in memory.
  */
-class CBlock
+class CBlock: public CBlockHeader
 {
 public:
     // header
-    static const int CURRENT_VERSION=3;
+    /*static const int CURRENT_VERSION=3;
     int nVersion;
     uint256 hashPrevBlock;
     uint256 hashMerkleRoot;
     unsigned int nTime;
     unsigned int nBits;
-    unsigned int nNonce;
+    unsigned int nNonce;*/
 
     // network and disk
     std::vector<CTransaction> vtx;
@@ -856,11 +1013,21 @@ public:
 
     // Denial-of-service detection:
     mutable int nDoS;
+
+	//hash cached
+	uint256 uhash;
+	
     bool DoS(int nDoSIn, bool fIn) const { nDoS += nDoSIn; return fIn; }
 
     CBlock()
     {
         SetNull();
+    }
+
+	CBlock(const CBlockHeader &header)
+    {
+        SetNull();
+        *((CBlockHeader*)this) = header;
     }
 
     IMPLEMENT_SERIALIZE
@@ -883,7 +1050,20 @@ public:
         {
             const_cast<CBlock*>(this)->vtx.clear();
             const_cast<CBlock*>(this)->vchBlockSig.clear();
+
         }
+
+
+		//pennies
+		if((nType & SER_SCRYPTHASH)
+			&& (nType & SER_DISK))
+		{
+			READWRITE(uhash);
+			if(fDebug)
+			{
+				printf("cblock, hash:%s\n", uhash.ToString().c_str());
+			}
+		}
     )
 
     void SetNull()
@@ -898,7 +1078,22 @@ public:
         vchBlockSig.clear();
         vMerkleTree.clear();
         nDoS = 0;
+
+		uhash = uint256(0);
     }
+	
+	CBlockHeader GetBlockHeader() const
+    {
+        CBlockHeader block;
+        block.nVersion       = nVersion;
+        block.hashPrevBlock  = hashPrevBlock;
+        block.hashMerkleRoot = hashMerkleRoot;
+        block.nTime          = nTime;
+        block.nBits          = nBits;
+        block.nNonce         = nNonce;
+        return block;
+    }
+	
 
     bool IsNull() const
     {
@@ -907,14 +1102,15 @@ public:
 
     uint256 GetHash() const
     {
-        uint256 thash;
         //void * scratchbuff = scrypt_buffer_alloc();
-
-        scrypt_hash(CVOIDBEGIN(nVersion), sizeof(block_header), UINTBEGIN(thash), GetNfactor(nTime));
+        if(uhash == uint256(0))
+		{
+       	 	scrypt_hash(CVOIDBEGIN(nVersion), sizeof(block_header), UINTBEGIN(uhash), GetNfactor(nTime));
+        }
 
         //scrypt_buffer_free(scratchbuff);
 
-        return thash;
+        return uhash;
     }
 
     int64 GetBlockTime() const
@@ -1027,7 +1223,7 @@ public:
     bool WriteToDisk(unsigned int& nFileRet, unsigned int& nBlockPosRet)
     {
         // Open history file to append
-        CAutoFile fileout = CAutoFile(AppendBlockFile(nFileRet), SER_DISK, CLIENT_VERSION);
+        CAutoFile fileout = CAutoFile(AppendBlockFile(nFileRet), SER_DISK , CLIENT_VERSION);
         if (!fileout)
             return error("CBlock::WriteToDisk() : AppendBlockFile failed");
 
@@ -1040,6 +1236,7 @@ public:
         if (fileOutPos < 0)
             return error("CBlock::WriteToDisk() : ftell failed");
         nBlockPosRet = fileOutPos;
+		fileout.nType |= SER_SCRYPTHASH;
         fileout << *this;
 
         // Flush stdio buffers and commit to disk before returning
@@ -1050,7 +1247,7 @@ public:
         return true;
     }
 
-    bool ReadFromDisk(unsigned int nFile, unsigned int nBlockPos, bool fReadTransactions=true)
+    bool ReadFromDisk(unsigned int nFile, unsigned int nBlockPos, bool fReadTransactions=true, bool fScryptHash=false)
     {
         SetNull();
 
@@ -1060,6 +1257,9 @@ public:
             return error("CBlock::ReadFromDisk() : OpenBlockFile failed");
         if (!fReadTransactions)
             filein.nType |= SER_BLOCKHEADERONLY;
+
+		if(fScryptHash)
+			filein.nType |= SER_SCRYPTHASH;
 
         // Read block
         try {
@@ -1238,6 +1438,9 @@ public:
 
     uint256 GetBlockHash() const
     {
+    	if(NULL == phashBlock){
+				return 0;
+    	}
         return *phashBlock;
     }
 
@@ -1368,6 +1571,7 @@ class CDiskBlockIndex : public CBlockIndex
 public:
     uint256 hashPrev;
     uint256 hashNext;
+	uint256 hashBlock;
 
     CDiskBlockIndex()
     {
@@ -1379,6 +1583,7 @@ public:
     {
         hashPrev = (pprev ? pprev->GetBlockHash() : 0);
         hashNext = (pnext ? pnext->GetBlockHash() : 0);
+        hashBlock = (pindex ? pindex->GetBlockHash() : 0);
     }
 
     IMPLEMENT_SERIALIZE
@@ -1414,18 +1619,20 @@ public:
         READWRITE(nTime);
         READWRITE(nBits);
         READWRITE(nNonce);
-    )
+		READWRITE(hashBlock);
+   )
 
     uint256 GetBlockHash() const
     {
-        CBlock block;
+        /*CBlock block;
         block.nVersion        = nVersion;
         block.hashPrevBlock   = hashPrev;
         block.hashMerkleRoot  = hashMerkleRoot;
         block.nTime           = nTime;
         block.nBits           = nBits;
         block.nNonce          = nNonce;
-        return block.GetHash();
+        return block.GetHash();*/
+        return hashBlock;
     }
 
 
@@ -1585,6 +1792,131 @@ public:
 
 
 
+
+
+/** Data structure that represents a partial merkle tree.
+ *
+ * It respresents a subset of the txid's of a known block, in a way that
+ * allows recovery of the list of txid's and the merkle root, in an
+ * authenticated way.
+ *
+ * The encoding works as follows: we traverse the tree in depth-first order,
+ * storing a bit for each traversed node, signifying whether the node is the
+ * parent of at least one matched leaf txid (or a matched txid itself). In
+ * case we are at the leaf level, or this bit is 0, its merkle node hash is
+ * stored, and its children are not explorer further. Otherwise, no hash is
+ * stored, but we recurse into both (or the only) child branch. During
+ * decoding, the same depth-first traversal is performed, consuming bits and
+ * hashes as they written during encoding.
+ *
+ * The serialization is fixed and provides a hard guarantee about the
+ * encoded size:
+ *
+ *   SIZE <= 10 + ceil(32.25*N)
+ *
+ * Where N represents the number of leaf nodes of the partial tree. N itself
+ * is bounded by:
+ *
+ *   N <= total_transactions
+ *   N <= 1 + matched_transactions*tree_height
+ *
+ * The serialization format:
+ *  - uint32     total_transactions (4 bytes)
+ *  - varint     number of hashes   (1-3 bytes)
+ *  - uint256[]  hashes in depth-first order (<= 32*N bytes)
+ *  - varint     number of bytes of flag bits (1-3 bytes)
+ *  - byte[]     flag bits, packed per 8 in a byte, least significant bit first (<= 2*N-1 bits)
+ * The size constraints follow from this.
+ */
+class CPartialMerkleTree
+{
+protected:
+    // the total number of transactions in the block
+    unsigned int nTransactions;
+
+    // node-is-parent-of-matched-txid bits
+    std::vector<bool> vBits;
+
+    // txids and internal hashes
+    std::vector<uint256> vHash;
+
+    // flag set when encountering invalid data
+    bool fBad;
+
+    // helper function to efficiently calculate the number of nodes at given height in the merkle tree
+    unsigned int CalcTreeWidth(int height) {
+        return (nTransactions+(1 << height)-1) >> height;
+    }
+
+    // calculate the hash of a node in the merkle tree (at leaf level: the txid's themself)
+    uint256 CalcHash(int height, unsigned int pos, const std::vector<uint256> &vTxid);
+
+    // recursive function that traverses tree nodes, storing the data as bits and hashes
+    void TraverseAndBuild(int height, unsigned int pos, const std::vector<uint256> &vTxid, const std::vector<bool> &vMatch);
+
+    // recursive function that traverses tree nodes, consuming the bits and hashes produced by TraverseAndBuild.
+    // it returns the hash of the respective node.
+    uint256 TraverseAndExtract(int height, unsigned int pos, unsigned int &nBitsUsed, unsigned int &nHashUsed, std::vector<uint256> &vMatch);
+
+public:
+
+    // serialization implementation
+    IMPLEMENT_SERIALIZE(
+        READWRITE(nTransactions);
+        READWRITE(vHash);
+        std::vector<unsigned char> vBytes;
+        if (fRead) {
+            READWRITE(vBytes);
+            CPartialMerkleTree &us = *(const_cast<CPartialMerkleTree*>(this));
+            us.vBits.resize(vBytes.size() * 8);
+            for (unsigned int p = 0; p < us.vBits.size(); p++)
+                us.vBits[p] = (vBytes[p / 8] & (1 << (p % 8))) != 0;
+            us.fBad = false;
+        } else {
+            vBytes.resize((vBits.size()+7)/8);
+            for (unsigned int p = 0; p < vBits.size(); p++)
+                vBytes[p / 8] |= vBits[p] << (p % 8);
+            READWRITE(vBytes);
+        }
+    )
+
+    // Construct a partial merkle tree from a list of transaction id's, and a mask that selects a subset of them
+    CPartialMerkleTree(const std::vector<uint256> &vTxid, const std::vector<bool> &vMatch);
+
+    CPartialMerkleTree();
+
+    // extract the matching txid's represented by this partial merkle tree.
+    // returns the merkle root, or 0 in case of failure
+    uint256 ExtractMatches(std::vector<uint256> &vMatch);
+};
+
+
+/** Used to relay blocks as header + vector<merkle branch>
+ * to filtered nodes.
+ */
+class CMerkleBlock
+{
+public:
+    // Public only for unit testing
+    CBlockHeader header;
+    CPartialMerkleTree txn;
+
+public:
+    // Public only for unit testing and relay testing
+    // (not relayed)
+    std::vector<std::pair<unsigned int, uint256> > vMatchedTxn;
+
+    // Create from a CBlock, filtering transactions according to filter
+    // Note that this will call IsRelevantAndUpdate on the filter for each transaction,
+    // thus the filter will likely be modified.
+    CMerkleBlock(const CBlock& block, CBloomFilter& filter);
+
+    IMPLEMENT_SERIALIZE
+    (
+        READWRITE(header);
+        READWRITE(txn);
+    )
+};
 
 
 class CTxMemPool

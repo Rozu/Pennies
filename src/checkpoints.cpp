@@ -256,6 +256,11 @@ namespace Checkpoints
     {
         if (fTestNet) return true; // Testnet has no checkpoints
         int nHeight = pindexPrev->nHeight + 1;
+		if(fDebug)
+		{
+			printf("checksync, hashBlock:%s, hashSyncCheckPoint:%s\n", 
+				hashBlock.ToString().c_str(), hashSyncCheckpoint.ToString().c_str());
+		}
 
         LOCK(cs_hashSyncCheckpoint);
         // sync-checkpoint should always be accepted block
@@ -379,7 +384,7 @@ namespace Checkpoints
 
         if(!checkpoint.ProcessSyncCheckpoint(NULL))
         {
-            printf("WARNING: SendSyncCheckpoint: Failed to process checkpoint.\n");
+            printf("WARNING: SendSyncCheckpoint: Failed to process checkpoint:%s\n", hashCheckpoint.ToString().c_str());
             return false;
         }
 
@@ -422,7 +427,7 @@ namespace Checkpoints
 }
 
 // ppcoin: sync-checkpoint master key
-const std::string CSyncCheckpoint::strMasterPubKey = "04bd3f419127f084f13e6d4ee35d915eb76e78f16b4c259c7ea5dbec5c4b4c0da5089060c1df266c1d167603ecedb2d5d49b26aefa165ad912dc3c664f429c6846";
+const std::string CSyncCheckpoint::strMasterPubKey = "04c7a688107077107d7e5f0d1699a36933a98ed0cbced6ca97ccb36ecfb3fd5d0b1907ffa39d285b44d86c4b81251ace83c8f971c03cb40a4b491b057a2256bcab";
 
 std::string CSyncCheckpoint::strMasterPrivKey = "";
 

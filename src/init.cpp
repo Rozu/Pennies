@@ -416,7 +416,12 @@ bool AppInit2()
 #endif
     fPrintToConsole = GetBoolArg("-printtoconsole");
     fPrintToDebugger = GetBoolArg("-printtodebugger");
-    fLogTimestamps = GetBoolArg("-logtimestamps");
+    fLogTimestamps = GetBoolArg("-logtimestamps", true);//timestamp is very important for debug
+    fLogPerf = GetBoolArg("-logperf");
+	nSyncThreshold = GetArg("-syncthreshold", 3000);
+	nSyncTimer = GetArg("-synctimer", 60);
+
+	printf("SyncTimer:%d, SyncThreshold:%d\n", nSyncTimer, nSyncThreshold);
 
     if (mapArgs.count("-timeout"))
     {
@@ -647,8 +652,9 @@ bool AppInit2()
         AddOneShot(strDest);
 
     // TODO: replace this by DNSseed
-    AddOneShot(string("82.211.30.212"));
-    AddOneShot(string("81.17.30.114"));
+	//delete unused ip
+    //AddOneShot(string("82.211.30.212"));
+    //AddOneShot(string("81.17.30.114"));
 
     // ********************************************************* Step 7: load blockchain
 
@@ -671,8 +677,11 @@ bool AppInit2()
     uiInterface.InitMessage(_("Loading block index..."));
     printf("Loading block index...\n");
     nStart = GetTimeMillis();
-    if (!LoadBlockIndex())
-        return InitError(_("Error loading blkindex.dat"));
+    if (!LoadBlockIndex()){
+		string msg= strprintf(_("You have old data, please backup wallet.dat, remove the folder '%s' and restart again. ")
+		, strDataDir.c_str());
+		return InitError(msg);
+    }
 
     // as LoadBlockIndex can take several minutes, it's possible the user
     // requested to kill bitcoin-qt during the last operation. If so, exit.

@@ -54,6 +54,9 @@ enum
     // modifiers
     SER_SKIPSIG         = (1 << 16),
     SER_BLOCKHEADERONLY = (1 << 17),
+
+	//pennies
+	SER_SCRYPTHASH      = (1 << 18),
 };
 
 #define IMPLEMENT_SERIALIZE(statements)    \

@@ -874,7 +874,10 @@ void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
         {
             uint256 hash = tx.GetHash();
             if (!txdb.ContainsTx(hash))
-                RelayMessage(CInv(MSG_TX, hash), (CTransaction)tx);
+			{
+                //RelayMessage(CInv(MSG_TX, hash), (CTransaction)tx);                
+            	RelayTransaction( tx, hash);
+            }
         }
     }
     if (!(IsCoinBase() || IsCoinStake()))
@@ -883,7 +886,8 @@ void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
         if (!txdb.ContainsTx(hash))
         {
             printf("Relaying wtx %s\n", hash.ToString().substr(0,10).c_str());
-            RelayMessage(CInv(MSG_TX, hash), (CTransaction)*this);
+            //RelayMessage(CInv(MSG_TX, hash), (CTransaction)*this);
+            RelayTransaction( (CTransaction)*this, hash);
         }
     }
 }
@@ -1391,6 +1395,11 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
     if (setCoins.empty())
         return false;
     int64 nCredit = 0;
+	
+	static int64 nQueryIndex = 0;
+	int64 nQueryMax = setCoins.size();
+	int64 nQueryStop = 10;
+	
     CScript scriptPubKeyKernel;
     BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)
     {
@@ -1407,6 +1416,15 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         if (block.GetBlockTime() + nStakeMinAge > txNew.nTime - nMaxStakeSearchInterval)
             continue; // only count coins meeting min age requirement
 
+	    //
+	    nQueryIndex++;
+	    if(nQueryIndex % nQueryStop == 0){
+			break;
+	    }
+
+		if(nQueryIndex >= nQueryMax){
+			nQueryIndex = 0;
+		}
         bool fKernelFound = false;
         for (unsigned int n=0; n<min(nSearchInterval,(int64)nMaxStakeSearchInterval) && !fKernelFound && !fShutdown; n++)
         {

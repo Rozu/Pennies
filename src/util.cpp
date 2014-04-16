@@ -77,6 +77,9 @@ string strMiscWarning;
 bool fTestNet = false;
 bool fNoListen = false;
 bool fLogTimestamps = false;
+bool fLogPerf = false;
+int  nSyncThreshold = 3000;
+int  nSyncTimer = 60;
 CMedianFilter<int64> vTimeOffsets(200,0);
 bool fReopenDebugLog = false;
 
@@ -200,7 +203,7 @@ uint256 GetRandHash()
 
 static FILE* fileout = NULL;
 
-inline int OutputDebugStringF(const char* pszFormat, ...)
+extern "C" inline int OutputDebugStringF(const char* pszFormat, ...)
 {
     int ret = 0;
     if (fPrintToConsole)
@@ -242,8 +245,21 @@ inline int OutputDebugStringF(const char* pszFormat, ...)
             }
 
             // Debug print useful for profiling
-            if (fLogTimestamps && fStartedNewLine)
-                fprintf(fileout, "%s ", DateTimeStrFormat("%x %H:%M:%S", GetTime()).c_str());
+            if (fLogTimestamps && fStartedNewLine){
+				if(fLogPerf)
+				{
+					struct timeval tms;
+					char tstr[100];
+					timerclear(&tms);
+					gettimeofday(&tms, NULL);
+					strftime(tstr, 100, "%X", localtime(&tms.tv_sec));
+					fprintf(fileout, "%s.%03d ", /*DateTimeStrFormat("%x %H:%M:%S", GetTime()).c_str()*/tstr,  tms.tv_usec/1000);
+				}
+				else
+				{
+					fprintf(fileout, "%s ", DateTimeStrFormat("%x %H:%M:%S", GetTime()).c_str());
+				}
+            }
             if (pszFormat[strlen(pszFormat) - 1] == '\n')
                 fStartedNewLine = true;
             else

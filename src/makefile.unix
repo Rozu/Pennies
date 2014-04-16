@@ -140,7 +140,9 @@ OBJS= \
     obj/scrypt_mine.o \
     obj/scrypt-x86.o \
     obj/scrypt-x86_64.o \
-    obj/scrypt-jane.o
+    obj/scrypt-jane.o \
+    obj/bloom.o \
+    obj/hash.o  
 
 
 all: pennies

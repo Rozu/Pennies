@@ -5,6 +5,8 @@
 */
 
 #include <string.h>
+#include <stdio.h>
+#include <malloc.h>
 
 #include "scrypt-jane.h"
 #include "code/scrypt-jane-portable.h"
@@ -26,8 +28,9 @@
 #define scrypt_maxr scrypt_r_32kb /* 32kb */
 #define scrypt_maxp 25  /* (1 << 25) = ~33 million */
 
-#include <stdio.h>
-#include <malloc.h>
+//debug performance
+#define printf OutputDebugStringF
+
 
 static void
 scrypt_fatal_error_default(const char *msg) {

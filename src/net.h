@@ -5,6 +5,7 @@
 #ifndef BITCOIN_NET_H
 #define BITCOIN_NET_H
 
+#include "bloom.h"
 #include <deque>
 #include <boost/array.hpp>
 #include <boost/foreach.hpp>
@@ -43,6 +44,9 @@ bool BindListenPort(const CService &bindAddr, std::string& strError=REF(std::str
 void StartNode(void* parg);
 bool StopNode();
 
+CNode * getNodeSync();
+
+
 enum
 {
     LOCAL_NONE,   // unknown
@@ -73,6 +77,9 @@ enum
 {
     MSG_TX = 1,
     MSG_BLOCK,
+    // Nodes may always request a MSG_FILTERED_BLOCK in a getdata, however,
+    // MSG_FILTERED_BLOCK should not appear in any invs except as a part of getdata.
+    MSG_FILTERED_BLOCK,
 };
 
 class CRequestTracker
@@ -160,7 +167,9 @@ public:
     SOCKET hSocket;
     CDataStream vSend;
     CDataStream vRecv;
+	size_t nSendSize; 
     CCriticalSection cs_vSend;
+    std::deque<CInv> vRecvGetData;
     CCriticalSection cs_vRecv;
     int64 nLastSend;
     int64 nLastRecv;
@@ -179,7 +188,15 @@ public:
     bool fNetworkNode;
     bool fSuccessfullyConnected;
     bool fDisconnect;
+	bool fReset;
+    // We use fRelayTxes for two purposes -
+    // a) it allows us to not relay tx invs before receiving the peer's version message
+    // b) the peer may tell us in their version message that we should not relay tx invs
+    //    until they have initialized their bloom filter.
+    bool fRelayTxes;
     CSemaphoreGrant grantOutbound;
+	CCriticalSection cs_filter;
+    CBloomFilter* pfilter;
 protected:
     int nRefCount;
 
@@ -197,6 +214,13 @@ public:
     CBlockIndex* pindexLastGetBlocksBegin;
     uint256 hashLastGetBlocksEnd;
     int nStartingHeight;
+	bool fStartSync;
+	int64 nSyncTime;
+	int64 nSyncLastCheckTime;
+	int nSyncHeight;
+	int nSyncLastHeight;
+	bool bUsed;
+	int nSpeed;
 
     // flood relay
     std::vector<CAddress> vAddrToSend;
@@ -231,16 +255,28 @@ public:
         fNetworkNode = false;
         fSuccessfullyConnected = false;
         fDisconnect = false;
+		fReset = false;
         nRefCount = 0;
         nReleaseTime = 0;
+		nSendSize = 0;
+		
         hashContinue = 0;
         pindexLastGetBlocksBegin = 0;
         hashLastGetBlocksEnd = 0;
         nStartingHeight = -1;
+        fStartSync = false;
+		nSyncTime = 0;
+		nSyncLastCheckTime = 0;
+		nSyncHeight = 0;
+		nSyncLastHeight = 0;
+		bUsed = false;
+		nSpeed = 0;
         fGetAddr = false;
+		fRelayTxes = false;
         nMisbehavior = 0;
         hashCheckpointKnown = 0;
         setInventoryKnown.max_size(SendBufferSize() / 1000);
+        pfilter = new CBloomFilter();
 
         // Be shy and don't send version until we hear
         if (!fInbound)
@@ -254,6 +290,8 @@ public:
             closesocket(hSocket);
             hSocket = INVALID_SOCKET;
         }
+        if (pfilter)
+            delete pfilter;
     }
 
 private:
@@ -346,7 +384,7 @@ public:
         vSend << CMessageHeader(pszCommand, 0);
         nMessageStart = vSend.size();
         if (fDebug)
-            printf("sending: %s ", pszCommand);
+            printf("sending: %s, ip:%s ", pszCommand, addr.ToString().c_str());
     }
 
     void AbortMessage()
@@ -619,7 +657,9 @@ public:
     bool IsSubscribed(unsigned int nChannel);
     void Subscribe(unsigned int nChannel, unsigned int nHops=0);
     void CancelSubscribe(unsigned int nChannel);
-    void CloseSocketDisconnect();
+    void CloseSocketDisconnect();	
+	bool OpenSocket();
+	bool Reset();
     void Cleanup();
 
 
@@ -649,10 +689,13 @@ public:
 
 
 
+class CTransaction;
+void RelayTransaction(const CTransaction& tx, const uint256& hash);
+void RelayTransaction(const CTransaction& tx, const uint256& hash, const CDataStream& ss);
 
 
 
-inline void RelayInventory(const CInv& inv)
+/*inline void RelayInventory(const CInv& inv)
 {
     // Put on lists to offer to the other nodes
     {
@@ -688,8 +731,24 @@ inline void RelayMessage<>(const CInv& inv, const CDataStream& ss)
         vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, inv));
     }
 
-    RelayInventory(inv);
-}
+    LOCK(cs_vNodes);
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if(!pnode->fRelayTxes)
+            continue;
+        LOCK(pnode->cs_filter);
+        if (pnode->pfilter)
+        {
+            if (pnode->pfilter->IsRelevantAndUpdate(tx, hash))
+                pnode->PushInventory(inv);
+        } else
+            pnode->PushInventory(inv);
+    }
+
+
+    //RelayInventory(inv);
+}*/
+
 
 
 #endif
