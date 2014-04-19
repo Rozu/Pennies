@@ -69,8 +69,7 @@ As of release 10.3.1,
    4. Fix the issue:Stake-Mining cost 100% CPU. 
    5. Fix crash issue. Old Version startup will crash in some PC because scrypt-hash has some CPU-specific code.
    6. Upgrade openn-ssl to 1.0.1g
-
-As of release 10.3.2,
+As of release 10.3.2
    1. fix a random crash issue
    2. disconnect zombie connection when syncing, it will accelerate syncing
 
