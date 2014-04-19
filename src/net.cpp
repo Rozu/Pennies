@@ -66,7 +66,7 @@ static bool vfReachable[NET_MAX] = {};
 static bool vfLimited[NET_MAX] = {};
 static CNode* pnodeLocalHost = NULL;
 CNode* pnodeSync = NULL;
-CNode* pnodeLastSync = NULL;
+//CNode* pnodeLastSync = NULL;
 
 CAddress addrSeenByPeer(CService("0.0.0.0", 0), nLocalServices);
 uint64 nLocalHostNonce = 0;
@@ -650,15 +650,16 @@ void CNode::CloseSocketDisconnect()
     if (lockRecv)
         vRecv.clear();
 
-	
-    //// if this was the sync node, we'll need a new one
+
+	//do not set NULL here, the thread "bitcoin-msghand" will crash when visiting pnodeSync
+    /*//// if this was the sync node, we'll need a new one
     if (this == pnodeSync)
         pnodeSync = NULL;
+        */
 }
 
-bool CNode::Reset()
+bool CNode::DisconnectWhenReset()
 {
-	SOCKET oldSocket = hSocket;
     if (hSocket != INVALID_SOCKET)
     {
         printf("reset, disconnecting node %s\n", addrName.c_str());
@@ -686,29 +687,21 @@ bool CNode::Reset()
 	    }
 	}
 
+	nReset = RESET_WAITING_FOR_CLEAR_MSG;
 
-	{
-	    TRY_LOCK(cs_inventory, lockInventory);
-	    if (lockInventory)
-	    {
-	        vInventoryToSend.clear();
-			setInventoryKnown.clear();
-			mapAskFor.clear();
-			hashContinue = 0;
-			pindexLastGetBlocksBegin = 0;
-			hashLastGetBlocksEnd = 0;
-			printf("reset, clear conext, node:%s\n", addrName.c_str());
-	    }
-	}
+	return true;
 
-	
+}
 
+
+bool CNode::ConnectWhenReset()
+{
 	bool ret =  OpenSocket();
-	fReset = false;
+	nReset = RESET_IDLE;
 
 	PushVersion();
 
-	printf("reset, ip:%s, oldsocket:%d, newsocket:%d\n", addrName.c_str(), oldSocket, hSocket);
+	printf("reset finished, ip:%s\n", addrName.c_str());
 	return ret;
 }
 
@@ -861,7 +854,7 @@ void ThreadSocketHandler2(void* parg)
 						//don't disconnect unused node when downloading
 						continue;
 					}*/
-                	printf("peerinfo, remove node:%s, fDisconnect:%d, refcount:%d, recv:%d, send:%d, speed:%d\n", 
+                	printf("peerinfo, remove node:%s, fDisconnect:%d, refcount:%d, recv:%"PRIszu", send:%"PRIszu", speed:%d\n", 
 						pnode->addr.ToString().c_str(),
 						pnode->fDisconnect,
 						pnode->GetRefCount(),
@@ -934,11 +927,16 @@ void ThreadSocketHandler2(void* parg)
             vector<CNode*> vNodesCopy = vNodes;
             BOOST_FOREACH(CNode* pnode, vNodesCopy)
             {
-            	if(pnode->fReset)
+            	if(RESET_WAITING_FOR_DISCONNECT == pnode->nReset)
             	{
-                    pnode->Reset();
+                    pnode->DisconnectWhenReset();
             	}
-            }
+				
+            	if(RESET_WAITING_FOR_CONNECTED == pnode->nReset)
+            	{
+                    pnode->ConnectWhenReset();
+            	}
+			}
 		}
 
         //
@@ -1847,11 +1845,9 @@ double static NodeSyncScore(const CNode *pnode) {
     return pnode->nSpeed;
 }
 
-void static StartSync(const vector<CNode*> &vNodes) {
+void static StartSync(const list<CNode*> &vNodes) {
     CNode *pnodeNewSync = NULL;
     double dBestScore = 0;
-
-    //int nBestHeight = g_signals.GetHeight().get_value_or(0);
 
     // Iterate over all nodes
     BOOST_FOREACH(CNode* pnode, vNodes) {
@@ -1882,11 +1878,232 @@ void static StartSync(const vector<CNode*> &vNodes) {
 		pnodeNewSync->nSyncTime = GetTime();
 		pnodeNewSync->nSyncHeight = nBestHeight;
 		printf("set syncnode:%s, lastspeed:%d, synctime:%"PRI64d", used:%d\n", 
-			pnodeSync->addr.ToString().c_str(), pnodeSync->nSpeed, pnodeSync->nSyncTime, pnodeSync->bUsed);
+			pnodeSync->addr.ToString().c_str(), pnodeSync->nSpeed, pnodeSync->nSyncTime, 
+			pnodeSync->bUsed);
 		pnodeNewSync->bUsed = true;
     }
 }
 
+void processSync()
+{
+	vector<CNode*> vNodesCopy;
+	
+	LOCK(cs_vNodes);
+	vNodesCopy = vNodes;
+	//clear msg for resetting node
+	BOOST_FOREACH(CNode* pnode, vNodesCopy)
+	{
+		//clear msg which is reseting node
+		//
+		if(RESET_WAITING_FOR_CLEAR_MSG == pnode->nReset)
+		{
+			printf("reset: clear msg, node:%s\n", pnode->addrName.c_str());
+			{
+				TRY_LOCK(pnode->cs_inventory, lockInventory);
+				if (lockInventory)
+				{
+					pnode->vInventoryToSend.clear();
+					pnode->setInventoryKnown.clear();
+					pnode->mapAskFor.clear();
+					pnode->hashContinue = 0;
+					pnode->pindexLastGetBlocksBegin = 0;
+					pnode->hashLastGetBlocksEnd = 0;
+				}
+			}
+		
+			pnode->nReset = RESET_WAITING_FOR_CONNECTED;
+		}
+	}
+
+	//select valid node to sync	
+    // Iterate over all nodes
+    
+	list<CNode*> vNodesToSync;
+    BOOST_FOREACH(CNode* pnode, vNodesCopy) {
+        // check preconditions for allowing a sync
+        if (!pnode->fClient && !pnode->fOneShot &&
+            !pnode->fDisconnect && pnode->fSuccessfullyConnected &&
+            (pnode->nStartingHeight > (nBestHeight - 144)) &&
+            (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)) {
+
+			vNodesToSync.push_back(pnode);
+        }
+    }
+	
+	//stage 0: there is no connected node, just return
+	if(vNodesToSync.size() <= 0)
+	{
+		return;
+	}
+	
+	//stage 1:there is connected nodes and nodesync is null, select one to be nodesync
+	if(NULL == pnodeSync)
+	{
+		printf("sync stage 1: nodesync is null, re-select\n");
+		StartSync(vNodesToSync);
+		return;
+	}
+
+	//stage 2:check valid
+	//nodesync exists, but state is incorrect, re-select
+	if(pnodeSync->fDisconnect)
+	{
+		printf("sync stage 2: check, ip:%s disconnected\n", pnodeSync->addr.ToString().c_str());
+		pnodeSync = NULL;
+		StartSync(vNodesToSync);
+		return;
+	}
+
+	
+	//check whether there are some logical error, if pnodesync is connected, the state of nReset must be RESET_IDLE
+	if(!pnodeSync->fDisconnect && RESET_IDLE != pnodeSync->nReset)
+	{
+		printf("sync stage 2: check state error, nodesync :%s disconnected, but the state is:%d\n", 
+			pnodeSync->addr.ToString().c_str(), pnodeSync->nReset);
+		pnodeSync = NULL;
+		StartSync(vNodesToSync);
+		return;
+	}
+
+	//pnodesync exists, but is not in connected node
+	bool fSyncConnected = false;
+	BOOST_FOREACH(CNode* pnode, vNodesCopy)
+	{
+		if(pnode == pnodeSync)
+		{
+			fSyncConnected = true;
+		}
+	}
+
+	if(!fSyncConnected)
+	{
+		printf("sync stage 2: check ip:%s, nodesync exists, but disconnected\n", pnodeSync->addr.ToString().c_str());
+		pnodeSync = NULL;
+		StartSync(vNodesToSync);
+		return;
+	}
+
+
+	//stage  3:check speed
+	//check speed
+	if( pnodeSync->nSyncLastCheckTime > 0)
+	{
+		int uDifTime = GetTime() - pnodeSync->nSyncLastCheckTime;
+		int uDifHeight = nBestHeight - pnodeSync->nSyncLastHeight;
+		if(uDifTime > nSyncTimer)//it's time to check
+		{
+			//update speed
+			pnodeSync->nSpeed = (pnodeSync->nSpeed + (uDifHeight / uDifTime)) / 2;
+
+			//stage 3.2.1
+			if(pnodeSync->nSpeed <= 0)
+			{
+				pnodeSync->fDisconnect = true;
+				printf("sync stage 3.2.1.1:timeout, disconnect node:%s\n", pnodeSync->addr.ToString().c_str());
+				pnodeSync = NULL;
+				StartSync(vNodesToSync);
+				return;
+			}
+			
+			if(uDifHeight <= nSyncThreshold)//at least sync 3000 blocks in one minute
+			{
+			
+					//check other node
+					int nMaxSpeed = 0;
+					bool fHasBetter = false;
+					CNode* pNodeWithMaxSpeed = NULL;
+					
+					list<CNode*> vNodesToSyncCopy = vNodesToSync;
+					BOOST_FOREACH(CNode* pnode, vNodesToSyncCopy)
+					{
+					
+						if(!pnode->bUsed)
+						{
+							printf("sync stage 3.2.2.1: there is unused ip %s to select\n", pnode->addr.ToString().c_str());
+							fHasBetter = true;
+							break;
+						}
+						
+						if(pnode->nSpeed > nMaxSpeed)
+						{
+							pNodeWithMaxSpeed = pnode;
+							nMaxSpeed = pnode->nSpeed;
+						}
+					
+					}//FOREACH
+			
+					int nCurrentSpeed = pnodeSync->nSpeed;
+					if(nCurrentSpeed < nMaxSpeed)
+					{
+						if(pNodeWithMaxSpeed)
+						{
+							printf("sync stage 3.2.2.2:there is better bandwidth ip:%s, speed:%d\n", 
+								pNodeWithMaxSpeed->addr.ToString().c_str(), nMaxSpeed);
+							fHasBetter = true;
+						}
+					}
+
+					if(fHasBetter)
+					{
+							
+							//disconnect pending node, reconnect other node to resume download
+							printf("sync stage 3.2.2.3:sync timeout, reset syncnode, last syncnode:%s, diftime:%d, last sync count:%d, syncthreshold:%d, speed:%d, maxspeed:%d\n", 
+								pnodeSync->addr.ToString().c_str(), uDifTime, uDifHeight, nSyncThreshold, pnodeSync->nSpeed, nMaxSpeed);
+
+							pnodeSync->fStartSync = false;
+							pnodeSync->nSyncTime = 0;
+							pnodeSync->nSyncHeight = 0;
+							pnodeSync->nSyncLastCheckTime = 0;
+							pnodeSync->nSyncLastHeight = 0;
+							
+							//SaveToSyncMap(pnodeSync);
+							//pnodeLastSync = pnodeSync;
+							//reset
+							pnodeSync->nReset = RESET_WAITING_FOR_DISCONNECT;
+
+							pnodeSync = NULL;
+							StartSync(vNodesToSync);
+							return;
+					}
+					else
+					{
+						//stage 3.2.2.4 no better node, continue to sync
+					}
+
+			}
+			else
+			{
+						//stage 3.2.1.3 goode node, continue to sync
+			}
+
+			
+			printf("sync stage 3.2.2.4:sync timeout, continue to sync, last syncnode:%s, diftime:%d, last sync count:%d, syncthreshold:%d, speed:%d\n", 
+				pnodeSync->addr.ToString().c_str(), uDifTime, uDifHeight, nSyncThreshold, pnodeSync->nSpeed);
+			//record current height to check whether node is in download pending later
+			pnodeSync->nSyncHeight = nBestHeight;
+			pnodeSync->nSyncLastCheckTime = GetTime();//pnodeSync->nSyncTime;
+			pnodeSync->nSyncLastHeight = nBestHeight;							
+			
+	    }
+		else
+		{
+					 //no need to check when time elapse below 60 seconds
+					 //stage 3.2.2
+		}				
+	}
+	else
+	{
+			  	   //nSyncLastCheckTime = 0 means this is the first check, save nSyncTime and nSyncHeight, prepared to be compared in future
+				   pnodeSync->nSyncLastCheckTime = GetTime();//pnodeSync->nSyncTime;
+				   pnodeSync->nSyncLastHeight = nBestHeight;//pnodeSync->nSyncHeight;
+				   printf("ip:%s,sync stage 3.1:start, time:%"PRI64d", height:%d\n", 
+				   	    pnodeSync->addr.ToString().c_str(),
+				   		pnodeSync->nSyncLastCheckTime, pnodeSync->nSyncLastHeight);
+	}			
+		
+
+	
+}
 
 
 
@@ -1917,137 +2134,15 @@ void ThreadMessageHandler2(void* parg)
     SetThreadPriority(THREAD_PRIORITY_BELOW_NORMAL);
     while (!fShutdown)
     {
-        /*vector<CNode*> vNodesCopy;
+        vector<CNode*> vNodesCopy;
         {
             LOCK(cs_vNodes);
             vNodesCopy = vNodes;
             BOOST_FOREACH(CNode* pnode, vNodesCopy)
                 pnode->AddRef();
-        }*/
-
-		
-        bool fHaveSyncNode = false;
-
-		//check nodesync timeout
-		if(NULL != pnodeSync)
-		{
-          	if( pnodeSync->nSyncLastCheckTime > 0)
-		  	{
-				int uDifTime = GetTime() - pnodeSync->nSyncLastCheckTime;
-				int uDifHeight = nBestHeight - pnodeSync->nSyncLastHeight;
-				if(uDifTime > nSyncTimer)//it's time to check
-				{
-					//update speed
-					int uLastSpeed = pnodeSync->nSpeed;
-					pnodeSync->nSpeed = (pnodeSync->nSpeed + (uDifHeight / uDifTime)) / 2;
-					
-					if(pnodeSync->nSpeed <= 0)
-					{
-						pnodeSync->fDisconnect = true;
-						printf("sync timeout, disconnect node:%s\n", pnodeSync->addr.ToString().c_str());
-					}
-
-					if(uDifHeight <= nSyncThreshold)//at least sync 3000 blocks in one minute
-					{
-						//check other node
-						int nMaxSpeed = 0;
-						bool fHasBetter = false;
-						vector<CNode*> vNodesCopy;
-						{
-							LOCK(cs_vNodes);
-							vNodesCopy = vNodes;
-							BOOST_FOREACH(CNode* pnode, vNodesCopy)
-							{
-								if(!pnode->bUsed)
-								{
-									fHasBetter = true;
-									break;
-								}
-
-								if(pnode->nSpeed > nMaxSpeed)
-								{
-									nMaxSpeed = pnode->nSpeed;
-								}
-							}
-						}
-
-						int nCurrentSpeed = pnodeSync->nSpeed;
-						if(nCurrentSpeed < nMaxSpeed)
-						{
-							fHasBetter = true;
-						}
-
-						if(fHasBetter)
-						{
-							//disconnect pending node, reconnect other node to resume download
-							printf("sync timeout, reset syncnode, last syncnode:%s, diftime:%d, last sync count:%d, syncthreshold:%d, speed:%d\n", 
-								pnodeSync->addr.ToString().c_str(), uDifTime, uDifHeight, nSyncThreshold, pnodeSync->nSpeed);
-
-							pnodeSync->fStartSync = false;
-							pnodeSync->nSyncTime = 0;
-							pnodeSync->nSyncHeight = 0;
-							pnodeSync->nSyncLastCheckTime = 0;
-							pnodeSync->nSyncLastHeight = 0;
-							
-							//SaveToSyncMap(pnodeSync);
-							pnodeLastSync = pnodeSync;
-							//reset
-							pnodeSync->fReset = true;
-
-							pnodeSync = NULL;
-						}
-						else
-						{
-							//disconnect pending node, reconnect other node to resume download
-							printf("sync timeout, continue to sync, last syncnode:%s, diftime:%d, last sync count:%d, syncthreshold:%d, speed:%d\n", 
-								pnodeSync->addr.ToString().c_str(), uDifTime, uDifHeight, nSyncThreshold, pnodeSync->nSpeed);
-							//record current height to check whether node is in download pending later
-							pnodeSync->nSyncHeight = nBestHeight;
-							pnodeSync->nSyncLastCheckTime = pnodeSync->nSyncTime;
-							pnodeSync->nSyncLastHeight = nBestHeight;
-							
-						}
-					}
-					else
-					{
-						//record current height to check whether node is in download pending later
-						pnodeSync->nSyncHeight = nBestHeight;
-						pnodeSync->nSyncLastCheckTime = pnodeSync->nSyncTime;
-						pnodeSync->nSyncLastHeight = nBestHeight;
-					}
-
-				}
-				else
-				{
-					//no need to check when time elapse below 60 seconds
-				}
-			 }
-			 else
-			 {
-			 	pnodeSync->nSyncLastCheckTime = pnodeSync->nSyncTime;
-				pnodeSync->nSyncLastHeight = pnodeSync->nSyncHeight;
-			 }
-		 }
-		 else
-		 {
-				//synced or no connection to sync
-		 }
-
-        vector<CNode*> vNodesCopy;
-        {
-            LOCK(cs_vNodes);
-            vNodesCopy = vNodes;
-            BOOST_FOREACH(CNode* pnode, vNodesCopy) {
-                pnode->AddRef();
-                if ((NULL != pnodeSync) && (pnode == pnodeSync))
-                {
-                    fHaveSyncNode = true;
-                }
-            }
         }
 
-        if (!fHaveSyncNode)
-            StartSync(vNodesCopy);
+		processSync();
 
         // Poll the connected nodes for messages
         CNode* pnodeTrickle = NULL;

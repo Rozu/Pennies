@@ -3403,17 +3403,20 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             return error("message inv size() = %"PRIszu"", vInv.size());
         }
 
-		CNode* pnode = getNodeSync();
-		if(pnode != NULL && pfrom != pnode)
 		{
-			return error("receive inv msg from ip:%s, but it's not the sync node:%s", 
-				pfrom->addr.ToString().c_str(), pnode->addr.ToString().c_str());
-		}
+			LOCK(cs_vNodes);
+			CNode* pnode = getNodeSync();
+			if(pnode != NULL && pfrom != pnode)
+			{
+				return error("receive inv msg from ip:%s, but it's not the sync node:%s", 
+					pfrom->addr.ToString().c_str(), pnode->addr.ToString().c_str());
+			}
 
-		if(pnode != NULL){
-			pnode->nSyncTime = GetTime();
-			pnode->nSyncHeight = nBestHeight;
-			printf("ip:%s, reset synctime:%"PRI64d", current height:%d\n", pnode->addr.ToString().c_str(), pnode->nSyncTime , pnode->nSyncHeight);
+			if(pnode != NULL){
+				pnode->nSyncTime = GetTime();
+				pnode->nSyncHeight = nBestHeight;
+				printf("ip:%s, reset synctime:%"PRI64d", current height:%d\n", pnode->addr.ToString().c_str(), pnode->nSyncTime , pnode->nSyncHeight);
+			}
 		}
 
         // find last block in inv vector
@@ -3469,12 +3472,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         if (fDebugNet || (vInv.size() != 1))
             printf("received getdata (%"PRIszu" invsz)\n", vInv.size());
 
-		
-		CNode* pnode = getNodeSync();
-		if(pnode != NULL && pnode->fStartSync)
 		{
-			return error("receive getdata msg from ip:%s, ignore it because i'm syncing", 
-				pfrom->addr.ToString().c_str());
+			LOCK(cs_vNodes);
+			CNode* pnode = getNodeSync();
+			if(pnode != NULL && pnode->fStartSync)
+			{
+				return error("receive getdata msg from ip:%s, ignore it because i'm syncing", 
+					pfrom->addr.ToString().c_str());
+			}
 		}
 
         /*BOOST_FOREACH(const CInv& inv, vInv)
@@ -3554,11 +3559,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         int nLimit = 500;
         printf("getblocks %d to %s limit %d\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,20).c_str(), nLimit);
 
-		CNode* pnode = getNodeSync();
-		if(pnode != NULL && pnode->fStartSync)
 		{
-			return error("receive getblocks msg from ip:%s, ignore it because i'm syncing", 
-				pfrom->addr.ToString().c_str());
+			LOCK(cs_vNodes);
+			CNode* pnode = getNodeSync();
+			if(pnode != NULL && pnode->fStartSync)
+			{
+				return error("receive getblocks msg from ip:%s, ignore it because i'm syncing", 
+					pfrom->addr.ToString().c_str());
+			}
 		}
 
 		for (; pindex; pindex = pindex->pnext)
@@ -3714,19 +3722,21 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         printf("received block %s\n", block.GetHash().ToString().c_str());
         // block.print();
 
-		
-		CNode* pnode = getNodeSync();
-		if(pnode != NULL && pfrom != pnode)
-		{
-			return error("receive block msg from ip:%s, but it's not the sync node:%s", 
-				pfrom->addr.ToString().c_str(), pnode->addr.ToString().c_str());
-		}
+        {
+			LOCK(cs_vNodes);
+			CNode* pnode = getNodeSync();
+			if(pnode != NULL && pfrom != pnode)
+			{
+				return error("receive block msg from ip:%s, but it's not the sync node:%s", 
+					pfrom->addr.ToString().c_str(), pnode->addr.ToString().c_str());
+			}
 
-		if(pnode != NULL){
-			pnode->nSyncTime = GetTime();
-			pnode->nSyncHeight = nBestHeight;
-			printf("ip:%s, reset synctime:%"PRI64d", current height:%d\n", pnode->addr.ToString().c_str(), pnode->nSyncTime , pnode->nSyncHeight);
-		}
+			if(pnode != NULL){
+				pnode->nSyncTime = GetTime();
+				pnode->nSyncHeight = nBestHeight;
+				printf("ip:%s, reset synctime:%"PRI64d", current height:%d\n", pnode->addr.ToString().c_str(), pnode->nSyncTime , pnode->nSyncHeight);
+			}
+        }
 		
         CInv inv(MSG_BLOCK, block.GetHash());
         pfrom->AddInventoryKnown(inv);
@@ -4150,7 +4160,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         if (pto->fStartSync) {
             pto->fStartSync = false;
 			
-			if(pnodeSync == pnodeLastSync)
+			/*if(pnodeSync == pnodeLastSync)
 			{
 				//still need to clear the map
 				//clear previous askfor map
@@ -4160,7 +4170,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
 			{
 				//clear previous askfor map
 				mapAlreadyAskedFor.clear();
-			}
+			}*/
+			mapAlreadyAskedFor.clear();
 			
             pto->PushGetBlocks(pindexBest, uint256(0));
 			printf("send getblocks to ip:%s, start hash:%s, end:0\n", 

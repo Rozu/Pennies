@@ -62,10 +62,14 @@ has also been added to the Bank.
 
 0.10.0 Fixes the stake issues, set to take effect on Jan 8th.
 
-As of 10.3.1,
+As of release 10.3.1,
    1. Accelerate startup. Old Version startup cost 30 minutes at least , new cost only 3 minutes at most. 
    2. Accelerate sync. Old Version can't sync normally. 
    3. Support Bloom Filter Protocol, it means Pennies will support Light-Wallet soon, Android Wallet will be released later. 
    4. Fix the issue:Stake-Mining cost 100% CPU. 
    5. Fix crash issue. Old Version startup will crash in some PC because scrypt-hash has some CPU-specific code.
    6. Upgrade openn-ssl to 1.0.1g
+As of release 10.3.2
+   1. fix a random crash issue
+   2. disconnect zombie connection when syncing, it will accelerate syncing
+

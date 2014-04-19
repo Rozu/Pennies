@@ -155,6 +155,12 @@ public:
 };
 
 
+enum{
+	RESET_IDLE,
+	RESET_WAITING_FOR_DISCONNECT,
+	RESET_WAITING_FOR_CLEAR_MSG,
+	RESET_WAITING_FOR_CONNECTED
+};
 
 
 
@@ -188,7 +194,7 @@ public:
     bool fNetworkNode;
     bool fSuccessfullyConnected;
     bool fDisconnect;
-	bool fReset;
+	int nReset;
     // We use fRelayTxes for two purposes -
     // a) it allows us to not relay tx invs before receiving the peer's version message
     // b) the peer may tell us in their version message that we should not relay tx invs
@@ -255,7 +261,7 @@ public:
         fNetworkNode = false;
         fSuccessfullyConnected = false;
         fDisconnect = false;
-		fReset = false;
+		nReset = RESET_IDLE;
         nRefCount = 0;
         nReleaseTime = 0;
 		nSendSize = 0;
@@ -659,7 +665,8 @@ public:
     void CancelSubscribe(unsigned int nChannel);
     void CloseSocketDisconnect();	
 	bool OpenSocket();
-	bool Reset();
+	bool DisconnectWhenReset();
+	bool ConnectWhenReset();
     void Cleanup();
 
 
