@@ -169,6 +169,15 @@ protected:
         // Write
         int ret = pdb->put(activeTxn, &datKey, &datValue, (fOverwrite ? 0 : DB_NOOVERWRITE));
 
+		if(ret != 0)
+		{
+			printf("%s, write error:%s\n", strFile.c_str(), db_strerror(ret));
+		}
+		else
+		{
+			//printf("%s, write success.\n", strFile.c_str());
+		}
+
         // Clear memory in case it was a private key
         memset(datKey.get_data(), 0, datKey.get_size());
         memset(datValue.get_data(), 0, datValue.get_size());

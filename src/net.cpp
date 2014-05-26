@@ -89,6 +89,9 @@ CCriticalSection cs_setservAddNodeAddresses;
 
 static CSemaphore *semOutbound = NULL;
 
+extern std::map<int, uint256> mapHardenSyncPoints;
+
+
 void AddOneShot(string strDest)
 {
     LOCK(cs_vOneShots);
@@ -159,6 +162,13 @@ int GetMaxOutboundConnections()
 
 void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
 {
+	if(IsInitialBlockDownload())
+	{
+		if(fDebug)
+			printf("ignore PushGetBlocks when concurrentsync\n");
+		return;
+	}
+	
     // Filter out duplicate requests
     if (pindexBegin == pindexLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd){
 		printf("duplicate PushGetBlocks request, ip:%s, hashEnd:%s\n", addr.ToString().c_str(), hashEnd.ToString().c_str());
@@ -918,7 +928,7 @@ void ThreadSocketHandler2(void* parg)
             uiInterface.NotifyNumConnectionsChanged(vNodes.size());
         }
 
-		//
+		/*//
 		//reset node, intent to clear sync context such as setInventoryKown on the remote node
 		//
 		
@@ -937,7 +947,7 @@ void ThreadSocketHandler2(void* parg)
                     pnode->ConnectWhenReset();
             	}
 			}
-		}
+		}*/
 
         //
         // Find which sockets have data to receive
@@ -1158,7 +1168,7 @@ void ThreadSocketHandler2(void* parg)
             }
 
 
-			//heartbeat
+			/*//heartbeat
 			if(pnodeSync)
 			{
 				bool bSendPing = false;
@@ -1184,7 +1194,7 @@ void ThreadSocketHandler2(void* parg)
 						pnode->nLastSend = GetTime();
 					}
 				}
-			}
+			}*/
 
             //
             // Inactivity checking
@@ -1383,8 +1393,10 @@ void MapPort()
 // Each pair gives a source name and a seed name.
 // The first name is used as information source for addrman.
 // The second name should resolve to a list of seed addresses.
-static const char *strDNSSeed[][2] = {
-    //{"pennies.org", "seed.pennies.su"},    // WM - Umm...  FIXME
+static const char *strDNSSeed[][9] = {
+    {"seed1.cent-pennies.com", "seed2.cent-pennies.com", "seed3.cent-pennies.com", 
+	 "seed1.cent-pennies.info", "seed2.cent-pennies.info", "seed3.cent-pennies.info",
+	 "seed1.cent-pennies.org", "seed2.cent-pennies.org", "seed3.cent-pennies.org"},    
 };
 
 void ThreadDNSAddressSeed(void* parg)
@@ -1884,6 +1896,570 @@ void static StartSync(const list<CNode*> &vNodes) {
     }
 }
 
+//util
+bool compare_speed(CNode* pNode1, CNode* pNode2)
+{
+	if(!pNode1->bUsed)
+		return true;
+
+	if(!pNode2->bUsed)
+		return false;
+	
+	return pNode1->nSpeed > pNode2->nSpeed;
+}
+
+bool compare_headerspeed(CNode* pNode1, CNode* pNode2)
+{
+	if(!pNode1->bHeaderUsed)
+		return true;
+
+	if(!pNode2->bHeaderUsed)
+		return false;
+	
+	return pNode1->nHeaderSpeed > pNode2->nHeaderSpeed;
+}
+
+#define JUMP_TO_NEXTSLOT  \
+	bJumpNext = true;	  \
+	nSlot++;			  \
+	if(nSlot >= nMaxSlot) \
+	{					  \
+		break;			  \
+	}					  \
+						  \
+	continue;			  
+
+void syncHeaders(int nMaxSlot, list<CNode*> vNodesToSync)
+{
+	bool bJumpNext = false;
+	static int64 nHeaderPollTime = 0;
+	int64 nNow = GetAdjustedTime();
+
+	if((nNow - nHeaderPollTime) < nHeaderConcurrentPollTime && nHeaderPollTime != 0)
+	{
+		return;
+	}
+
+	//printf("concurrent sync start..., lastchecktime:%"PRI64d", now:%"PRI64d"\n", nPollTime, nNow);
+
+	nHeaderPollTime = nNow;
+
+
+	//stage 2: sorted by speed
+	vNodesToSync.sort(compare_headerspeed);
+
+
+	//printf("concurrent sync start..., lastchecktime:%"PRI64d", now:%"PRI64d"\n", nPollTime, nNow);
+
+	//restrict the concurrent
+	int nNodeSize = 0;
+
+
+	int nSlot = 0;
+    BOOST_FOREACH(CNode* pnode, vNodesToSync) {
+		//stage 3:download headers if no finished
+		loop
+		{
+			bJumpNext = false;
+			SyncPoint* pSyncHeadersPoint = vSyncHeadersPoints[nSlot];
+			//check finished
+			if(pSyncHeadersPoint->startHeight >= pnode->nStartingHeight)
+			{
+				JUMP_TO_NEXTSLOT
+			}
+			//checkdownloaded
+			if(pSyncHeadersPoint->startHeight < pSyncHeadersPoint->endHeight || 0 == pSyncHeadersPoint->endHeight)
+			{
+				loop
+				{
+					int nHeight = pSyncHeadersPoint->startHeight + 1;
+					map<int, uint256>::const_iterator begin = mapSyncHeight2Hash.find(nHeight);
+					if(begin == mapSyncHeight2Hash.end())
+					{
+						//next height not found
+						break;
+					}
+					else
+					{
+						pSyncHeadersPoint->startHeight++;
+						if(pSyncHeadersPoint->startHeight >= pSyncHeadersPoint->endHeight 
+							&& 0 != pSyncHeadersPoint->endHeight)
+						{
+							break;
+						}
+					}
+				}
+			}
+			
+			//if current slot finished, jump to next slot
+			if(pSyncHeadersPoint->startHeight == pSyncHeadersPoint->endHeight)
+			{
+				JUMP_TO_NEXTSLOT
+			}
+
+
+			if(pSyncHeadersPoint->startHeight < pSyncHeadersPoint->endHeight || 0 == pSyncHeadersPoint->endHeight)
+			{
+				map<int, uint256>::const_iterator begin = mapSyncHeight2Hash.find(pSyncHeadersPoint->startHeight);
+	        	if (begin == mapSyncHeight2Hash.end())
+	        	{
+	        		//assert
+	        		printf("slot:%d, ip:%s, getheaders interrupt at %d, error(that is impossible).\n", nSlot, pnode->addr.ToString().c_str(), 
+	        			pSyncHeadersPoint->startHeight);
+	        		continue;
+	        	}
+				uint256 hashBegin = begin->second;
+
+
+				uint256 hashEnd = uint256(0);
+
+				if(0 != pSyncHeadersPoint->endHeight)
+				{
+					map<int, uint256>::const_iterator end = mapSyncHeight2Hash.find(pSyncHeadersPoint->endHeight);
+		        	if (end == mapSyncHeight2Hash.end())
+		        	{
+		        		//assert
+		        	}
+					hashEnd = end->second;
+				}
+
+				bool bSend = true;
+				int64 nNow = GetAdjustedTime();
+				if(hashBegin == pnode->getHeadersHashBegin && hashEnd == pnode->getHeadersHashEnd)
+				{
+					
+					if((nNow - pnode->nSendGetHeadersTime) < nConcurrentRetry)
+					{
+						bSend = false;
+					}
+				}
+
+				if(bSend)
+				{
+					printf("slot:%d, ip:%s, send getheaders, start:%d, end:%d, hashbegin:%s, hashend:%s, speed:%d\n",
+						nSlot, pnode->addr.ToString().c_str(), 
+						pSyncHeadersPoint->startHeight,
+						pSyncHeadersPoint->endHeight,
+						hashBegin.ToString().c_str(), hashEnd.ToString().c_str(),
+						pnode->nSpeed);
+					std::vector<uint256> vhash;
+					vhash.push_back(hashBegin);
+					pnode->PushMessage("getheaders", CBlockLocator(vhash), hashEnd);
+					pnode->nSendGetHeadersTime = nNow;
+					pnode->getHeadersHashBegin = hashBegin;
+					pnode->getHeadersHashEnd = hashEnd;
+					pnode->bHeaderUsed = true;
+				}
+			}
+			
+			break;
+		}
+
+		if(bJumpNext)
+		{
+			if(nSlot >= nMaxSlot)
+				break;
+
+			continue;
+		}
+
+		nNodeSize++;
+		if(nNodeSize >= nHeaderConcurrent)
+			break;
+		
+		nSlot++;
+		if(nSlot >= nMaxSlot)
+			break;
+
+    }
+
+}
+
+void syncBlocks(int nMaxSlot, list<CNode*> vNodesToSync)
+{
+	bool bJumpNext = false;
+	int nMaxBlocksOnce = 1000;
+	static int64 nPollTime = 0;
+	int64 nNow = GetAdjustedTime();
+
+
+	if((nNow - nPollTime) < nConcurrentPollTime && nPollTime != 0)
+	{
+		return;
+	}
+
+	nPollTime = nNow;
+
+	//stage 2: sorted by speed
+	vNodesToSync.sort(compare_speed);
+
+	int nSlot = 0;
+	int nNodeSize = 0;
+	//two loop, node loop, slot loop, each node process one slot
+	//three cases:
+	//1. nodes > slots
+	//2. nodes == slots
+	//3. nodes < slots
+	BOOST_FOREACH(CNode* pnode, vNodesToSync) {
+		//stage 4:download blocks
+		//need to gethash
+		loop
+		{
+			bJumpNext = false;
+			SyncPoint* pSyncBlocksPoint = vSyncBlocksPoints[nSlot];
+			
+			//stage 4.1:check downloaded
+			//four pointer: start, end, startwithhash, endwithhash
+			//askfor:startwithhash-endwithhash
+			bool fHashNotExist = false;
+			bool fNeedToAskFor = false;
+			bool fFinished = false;
+			loop
+			{
+				if(pSyncBlocksPoint->startHeight >= pSyncBlocksPoint->endHeight && (0 != pSyncBlocksPoint->endHeight))
+				{
+					fFinished = true;
+					//if(fDebug)
+					//	printf("slot:%d, ip:%s, finished(start>=endheight), startheight:%d, endheight:%d, total:%d\n", 
+					//			nSlot, pnode->addr.ToString().c_str(),  pSyncBlocksPoint->startHeight,
+					//			pSyncBlocksPoint->endHeight, pnode->nStartingHeight);
+					break;//finished
+				}
+
+				if(pSyncBlocksPoint->startHeight >= pnode->nStartingHeight)
+				{
+					fFinished = true;
+					if(fDebug)
+						printf("slot:%d, ip:%s, finished(start>=total), startheight:%d, endheight:%d, total:%d\n", 
+								nSlot, pnode->addr.ToString().c_str(),  pSyncBlocksPoint->startHeight,
+								pSyncBlocksPoint->endHeight, pnode->nStartingHeight);
+					break;
+				}
+				
+				//check header ready, if not ready, ignore it until headers downloaded			
+				map<int, uint256>::const_iterator begin = mapSyncHeight2Hash.find(pSyncBlocksPoint->startHeight);
+				if(begin == mapSyncHeight2Hash.end())
+				{
+					fHashNotExist = true;
+					//if(fDebug)
+					//	printf("slot:%d, ip:%s, hash not exist, startheight:%d, endheight:%d, total:%d\n", 
+					//			nSlot, pnode->addr.ToString().c_str(),  pSyncBlocksPoint->startHeight,
+					//			pSyncBlocksPoint->endHeight, pnode->nStartingHeight);
+					break;//not ready
+				}
+
+				uint256 uHash = begin->second;
+
+				if(mapBlockIndex.count(uHash)
+					|| mapOrphanBlocks.count(uHash))
+				{
+					pSyncBlocksPoint->startHeight++; //downloaded
+				}
+				else
+				{
+					//not yet downloaded, ask for
+					//now startwithhash = startHeight
+					fNeedToAskFor = true;
+					//if(fDebug)
+					//	printf("slot:%d, ip:%s, need to askfor, startheight:%d, endheight:%d, total:%d\n", 
+					//			nSlot, pnode->addr.ToString().c_str(),  pSyncBlocksPoint->startHeight,
+					//			pSyncBlocksPoint->endHeight, pnode->nStartingHeight);
+					break;
+				}
+
+			}
+
+			//now two case:
+			//1. hash correspond to startHeight does not exist in mapHeight2Hash;
+			//2. hash exists in map, but block does not exist 
+
+			//stage 4.2:check finished
+			if(fHashNotExist)
+			{
+				JUMP_TO_NEXTSLOT
+			}
+			
+			//nStartingHeight is the max height of the node
+			if(fFinished)
+			{
+				JUMP_TO_NEXTSLOT
+			}
+
+			//now need to ask for
+			if(!fNeedToAskFor)
+			{
+				printf("assert failed! impossible branch when ready to askfor block, height:%d\n", pSyncBlocksPoint->startHeight);
+				JUMP_TO_NEXTSLOT
+			}
+			
+			//stage 4.3:check ask for
+			//bool fSearchEndWithHash = false;
+			//bool fMaxStop = false;
+			int nHeight = pSyncBlocksPoint->startHeight;
+			vector<uint256> vAskforHash;
+			int nCount = 0;
+			loop
+			{
+				if(nHeight > pSyncBlocksPoint->endHeight && 0 != pSyncBlocksPoint->endHeight)
+				{
+					//fMaxStop = true;
+					break;
+				}
+				
+				if(nHeight > pnode->nStartingHeight)
+				{
+					//fMaxStop = true;
+					break;
+				}
+				//check header ready, if not ready, ignore it until headers downloaded			
+				map<int, uint256>::const_iterator begin = mapSyncHeight2Hash.find(nHeight);
+				if(begin == mapSyncHeight2Hash.end())
+				{
+					//fSearchEndWithHash = true;
+					break;//not ready
+				}
+
+				uint256 uHash = begin->second;
+
+				if(mapBlockIndex.count(uHash)
+					|| mapOrphanBlocks.count(uHash))
+				{
+					//pSyncBlocksPoint->startHeight++; //downloaded
+					//printf("assert failed!impossible branch, logic error when processConcurrentSync, height:%d.\n", nHeight);
+					//break;
+					nHeight++;
+					continue; //ignore it, retry to ask for next block
+				}
+				else
+				{
+					//not yet downloaded, ask for
+					//pnode->AskFor(CInv(MSG_BLOCK, uHash));
+					vAskforHash.push_back(uHash);
+					nCount++;
+					if(nCount >= nMaxBlocksOnce)
+					{
+						//fMaxStop = true;
+						break;
+					}
+				}
+				nHeight++;
+			}
+
+			//now four cases:
+			//1. fSearchEndWithHash, nHeight = startHeight, impossible branch, because this case has been rejected by 4.2
+			//2. fSearchEndWithHash, nHeight > startHeight, need to ask for
+			//3. fMaxStop, nHeight = startHeight, only one (nHeight - startHeight + 1) needed to askfor
+			//4. fMaxStop, nHeight > startHeight, nHeight - startHeight + 1 needed to ask for
+
+			//now, startHeight to nHeight is intended to ask for
+			//stage4.4:check header ready, if startHeight is not ready, it means all block headers not ready,
+			//need to wait for header downloaded, so ignore it 			
+			//
+			
+			if(nCount > 0)
+			{
+
+				uint256 hashBegin = vAskforHash[0];
+
+
+				uint256 hashEnd = vAskforHash[nCount - 1];
+
+				bool bSend = true;
+				int64 nNow = GetAdjustedTime();
+				if(nNow - pnode->nSendGetDataTime < nConcurrentPollTime)
+				{
+					bSend = false;
+				}
+				
+				if(hashBegin == pnode->getDataHashBegin && hashEnd == pnode->getDataHashEnd)
+				{
+					
+					if((nNow - pnode->nSendGetDataTime) < nConcurrentRetry)
+					{
+						bSend = false;
+					}
+				}
+
+				if(bSend)
+				{
+					printf("slot:%d, ip:%s, send getblocks, start:%d, end:%d, count:%d, hashbegin:%s, hashend:%s\n",
+						nSlot, pnode->addr.ToString().c_str(), 
+						pSyncBlocksPoint->startHeight,
+						nHeight,
+						nCount,
+						hashBegin.ToString().c_str(), hashEnd.ToString().c_str());
+					//std::vector<uint256> vhash;
+					//vhash.push_back(hashBegin);
+					//pnode->PushMessage("getheaders", CBlockLocator(vhash), hashEnd);
+					for(int i = 0; i < nCount; i++)
+					{
+						uint256 uHash = vAskforHash[i];
+						pnode->AskFor(CInv(MSG_BLOCK, uHash));
+					}
+					pnode->nSendGetDataTime = nNow;
+					pnode->getDataHashBegin = hashBegin;
+					pnode->getDataHashEnd = hashEnd;
+					pnode->bUsed = true;
+				}
+			}
+			
+			break;
+		}
+
+		if(bJumpNext)
+		{
+			if(nSlot >= nMaxSlot)
+				break;
+
+			continue;
+		}
+		
+		nNodeSize++;
+		if(nNodeSize >= nConcurrent)
+			break;
+
+		nSlot++;
+		if(nSlot >= nMaxSlot)
+			break;
+
+
+    }
+
+}
+
+void processConcurrentSync()
+{
+
+	static int64 nCheckIPTime = 0;
+	int64 nNow = GetAdjustedTime();
+	/*static int64 nHeaderPollTime = 0;
+	static int64 nPollTime = 0;
+	
+
+	if((nNow - nHeaderPollTime) < nHeaderConcurrentPollTime && nHeaderPollTime != 0)
+	{
+		return;
+	}
+
+	//printf("concurrent sync start..., lastchecktime:%"PRI64d", now:%"PRI64d"\n", nPollTime, nNow);
+
+	nHeaderPollTime = nNow;*/
+
+	if(nCheckIPTime == 0)
+	{
+		nCheckIPTime = nNow;
+	}
+	
+	//initial context
+	static int nMaxSlot = 0;
+	if(0 == vSyncHeadersPoints.size())
+	{
+		nMaxSlot = 0;
+		SyncPoint* pPrevSyncHeaderPoint = NULL;
+		SyncPoint* pPrevSyncBlockPoint = NULL;
+		//int nSize = mapHardenSyncPoints.size();
+		map<int,uint256>::iterator it;
+        for(it=mapHardenSyncPoints.begin();it!=mapHardenSyncPoints.end();++it)
+		{
+			int nStart = it->first;
+			//int nEnd = mapHardenSyncPoints.get(i+1).first;
+			//uint
+			if(NULL != pPrevSyncHeaderPoint)
+			{
+				pPrevSyncHeaderPoint->endHeight = nStart - 1;
+				pPrevSyncBlockPoint->endHeight = nStart - 1;
+			}
+			SyncPoint* pSyncHeaderPoint = new SyncPoint(nStart, 0);
+			SyncPoint* pSyncBlockPoint = new SyncPoint(nStart, 0);
+			vSyncHeadersPoints.push_back(pSyncHeaderPoint);
+			vSyncBlocksPoints.push_back(pSyncBlockPoint);
+			mapSyncHeight2Hash.insert(std::pair<int, uint256>(it->first, it->second));
+			mapSyncHash2Height.insert(std::pair<uint256, int>(it->second, it->first));
+			nMaxSlot++;
+			pPrevSyncHeaderPoint = pSyncHeaderPoint;
+			pPrevSyncBlockPoint  = pSyncBlockPoint;
+		}
+	}
+	//dynamical const
+	int nMaxBlockCount = 400000;
+	vector<CNode*> vNodesCopy;
+	
+	LOCK(cs_vNodes);
+	vNodesCopy = vNodes;
+	//stage 1:check best connections:unused or best speed
+	list<CNode*> vNodesToSync;
+    BOOST_FOREACH(CNode* pnode, vNodesCopy) {
+        // check preconditions for allowing a sync
+        if (!pnode->fClient && //!pnode->fOneShot &&
+            !pnode->fDisconnect && pnode->fSuccessfullyConnected &&
+            (pnode->nStartingHeight > (nMaxBlockCount - 144)) &&
+            (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)) {
+
+			if(pnode->nVersion >= 70002)//getheaders
+			{
+				if((nNow - pnode->nCheckSpeedTime) > 60)
+				{
+					pnode->nCheckSpeedTime = nNow;
+					pnode->nSpeed = ((pnode->nDownloaded / 60) + pnode->nSpeed) / 2;
+					pnode->nHeaderSpeed = ((pnode->nHeaderDownloaded / 60) + pnode->nHeaderSpeed) / 2;
+					printf("concurrent sync, ip:%s, speed:%d, downloaded:%d\n", pnode->addr.ToString().c_str(), pnode->nSpeed,
+						pnode->nDownloaded);
+					pnode->nDownloaded = 0;
+					pnode->nHeaderDownloaded = 0;
+				}
+				vNodesToSync.push_back(pnode);
+			}
+        }
+    }
+
+
+
+	//return;
+	syncHeaders(nMaxSlot, vNodesToSync);
+	syncBlocks(nMaxSlot, vNodesToSync);
+	
+
+	
+	if((nNow - nCheckIPTime) > 60)
+	{
+		int i = 0;
+		printf("concurrent sync begin-------------------------------------------------------\n");//for grep
+		BOOST_FOREACH(CNode* pnode, vNodesToSync) {
+			printf("concurrent sync, ip index:%d, ip:%s, speed:%d, bused:%d\n", i, pnode->addr.ToString().c_str(),
+				pnode->nSpeed, pnode->bUsed);
+			i++;
+		}
+		nCheckIPTime = nNow;
+
+
+		printf("concurrent sync end+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n");//for grep
+
+		for(i = 0; i < nMaxSlot; i++)
+		{
+			SyncPoint* pSyncHeadersPoint = vSyncHeadersPoints[i];
+			printf("concurrent sync, header index:%d, start:%d, end:%d\n", i, pSyncHeadersPoint->startHeight,
+				pSyncHeadersPoint->endHeight);
+		}
+
+		printf("concurrent sync end**********************************************************\n");//for grep
+
+		for(i = 0; i < nMaxSlot; i++)
+		{
+			SyncPoint* pSyncHeadersPoint = vSyncBlocksPoints[i];
+			printf("concurrent sync, block index:%d, start:%d, end:%d\n", i, pSyncHeadersPoint->startHeight,
+				pSyncHeadersPoint->endHeight);
+		}
+
+		printf("concurrent sync end-------------------------------------------------------\n");//for grep
+	}
+
+
+
+	
+	//printf("concurrent sync end..., lastchecktime:%"PRI64d", now:%"PRI64d"\n", nPollTime, nNow);
+	
+}
+
 void processSync()
 {
 	vector<CNode*> vNodesCopy;
@@ -2105,8 +2681,6 @@ void processSync()
 	
 }
 
-
-
 void ThreadMessageHandler(void* parg)
 {
     // Make this thread recognisable as the message handling thread
@@ -2142,7 +2716,11 @@ void ThreadMessageHandler2(void* parg)
                 pnode->AddRef();
         }
 
-		processSync();
+		//processSync();
+		if(IsInitialBlockDownload())
+		{
+			processConcurrentSync();
+		}
 
         // Poll the connected nodes for messages
         CNode* pnodeTrickle = NULL;
@@ -2153,8 +2731,14 @@ void ThreadMessageHandler2(void* parg)
             // Receive messages
             {
                 TRY_LOCK(pnode->cs_vRecv, lockRecv);
+				
+				//int64 nBegin = GetAdjustedTime();
                 if (lockRecv)
                     ProcessMessages(pnode);
+				//int64 nEnd = GetAdjustedTime();
+				
+				//if((nEnd - nBegin) > 3)
+				//	printf("process message timeout %"PRI64d", %"PRI64d"\n", nBegin, nEnd);
             }
             if (fShutdown)
                 return;
@@ -2376,13 +2960,13 @@ void StartNode(void* parg)
     // Start threads
     //
 
-/*
+
     if (!GetBoolArg("-dnsseed", true))
         printf("DNS seeding disabled\n");
     else
         if (!NewThread(ThreadDNSAddressSeed, NULL))
             printf("Error: NewThread(ThreadDNSAddressSeed) failed\n");
-*/
+
 
     if (!GetBoolArg("-dnsseed", false))
         printf("DNS seeding disabled\n");

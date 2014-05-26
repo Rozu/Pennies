@@ -312,7 +312,10 @@ void CAddrMan::Good_(const CService &addr, int64 nTime)
 bool CAddrMan::Add_(const CAddress &addr, const CNetAddr& source, int64 nTimePenalty)
 {
     if (!addr.IsRoutable())
+    {
+    	printf("address add failed, not routable:%s\n", addr.ToString().c_str());
         return false;
+    }
 
     bool fNew = false;
     int nId;

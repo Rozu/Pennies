@@ -418,10 +418,20 @@ bool AppInit2()
     fPrintToDebugger = GetBoolArg("-printtodebugger");
     fLogTimestamps = GetBoolArg("-logtimestamps", true);//timestamp is very important for debug
     fLogPerf = GetBoolArg("-logperf");
-	nSyncThreshold = GetArg("-syncthreshold", 3000);
-	nSyncTimer = GetArg("-synctimer", 60);
+	nSyncThreshold = GetArg("-syncthreshold", nSyncThreshold);
+	nSyncTimer = GetArg("-synctimer", nSyncTimer);
 
-	printf("SyncTimer:%d, SyncThreshold:%d\n", nSyncTimer, nSyncThreshold);
+	nConcurrent = GetArg("-concurrent", nConcurrent);
+	nHeaderConcurrent = GetArg("-headerconcurrent", nHeaderConcurrent);
+	nConcurrentPollTime = GetArg("-concurrentpolltime", nConcurrentPollTime);
+	nHeaderConcurrentPollTime = GetArg("-headerconcurrentpolltime", nHeaderConcurrentPollTime);
+	nConcurrentRetry = GetArg("-concurrentretry", nConcurrentRetry);
+
+	MAX_MONEY_10_3_3_EFFECTIVE_DATE = GetArg("-effectdate", MAX_MONEY_10_3_3_EFFECTIVE_DATE);
+
+	printf("SyncTimer:%d, SyncThreshold:%d, concurrent:%d, headerconcurrent:%d, polltime:%d, headerpolltime:%d,retry:%d, effectdate:%d\n", nSyncTimer, nSyncThreshold, 
+		nConcurrent, nHeaderConcurrent, nConcurrentPollTime, nHeaderConcurrentPollTime,
+		nConcurrentRetry, MAX_MONEY_10_3_3_EFFECTIVE_DATE);
 
     if (mapArgs.count("-timeout"))
     {
@@ -653,8 +663,11 @@ bool AppInit2()
 
     // TODO: replace this by DNSseed
 	//delete unused ip
-    //AddOneShot(string("82.211.30.212"));
-    //AddOneShot(string("81.17.30.114"));
+    AddOneShot(string("162.243.212.92"));
+	AddOneShot(string("95.85.5.8"));
+	AddOneShot(string("128.199.195.230"));
+	AddOneShot(string("107.170.89.222"));
+	AddOneShot(string("115.28.242.21"));
 
     // ********************************************************* Step 7: load blockchain
 

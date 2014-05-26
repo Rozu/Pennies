@@ -35,9 +35,23 @@ static const unsigned int MAX_INV_SZ = 50000;
 static const int64 MIN_TX_FEE = 0;
 static const int64 MIN_RELAY_TX_FEE = 0;
 static const int64 MAX_MONEY = 1000000000 * CENT;
+static const int64 MAX_MONEY_10_3_3 = 100000000000000 * CENT;
+static const int64 MAX_INTEREST = 3333;//0.0003
+
+extern int MAX_MONEY_10_3_3_EFFECTIVE_DATE; 
+
 static const int64 MAX_MINT_PROOF_OF_WORK = 1 * CENT;
 static const int64 MIN_TXOUT_AMOUNT = MIN_TX_FEE;
-inline bool MoneyRange(int64 nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
+inline int64 GetMaxMoney(){	
+	//check maxmoney
+	int64 iMaxMoney = MAX_MONEY;
+	if(GetAdjustedTime() > MAX_MONEY_10_3_3_EFFECTIVE_DATE)
+	{
+		iMaxMoney = MAX_MONEY_10_3_3;
+	}
+	return iMaxMoney;
+}
+inline bool MoneyRange(int64 nValue) { return (nValue >= 0 && nValue <= GetMaxMoney()); }
 // Threshold for nLockTime: below this value it is interpreted as block number, otherwise as UNIX timestamp.
 static const unsigned int LOCKTIME_THRESHOLD = 500000000; // Tue Nov  5 00:53:20 1985 UTC
 
@@ -428,7 +442,7 @@ class CBlockHeader
 {
 public:
     // header
-    static const int CURRENT_VERSION=4;
+    static const int CURRENT_VERSION=5;
     int nVersion;
     uint256 hashPrevBlock;
     uint256 hashMerkleRoot;

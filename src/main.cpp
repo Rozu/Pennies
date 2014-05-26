@@ -14,6 +14,7 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
+#include <boost/assign/list_of.hpp> // for 'map_list_of()'
 
 using namespace std;
 using namespace boost;
@@ -51,6 +52,8 @@ uint256 hashBestChain = 0;
 CBlockIndex* pindexBest = NULL;
 int64 nTimeBestReceived = 0;
 
+int MAX_MONEY_10_3_3_EFFECTIVE_DATE= 1402358400;// June 10 00:00:00 2014 UTC
+
 CMedianFilter<int> cPeerBlockCounts(5, 0); // Amount of blocks that other nodes claim to have
 
 map<uint256, CBlock*> mapOrphanBlocks;
@@ -74,6 +77,34 @@ int64 nTransactionFee = MIN_TX_FEE;
 
 extern CNode* pnodeSync;
 extern CNode* pnodeLastSync;
+
+//Pennies-concurrent-sync
+std::map<int, uint256> mapHardenSyncPoints =
+	boost::assign::map_list_of
+	(	  0, hashGenesisBlockOfficial )
+	( 40000, uint256("0x00000002413e0321a92631b79cf7cb31045a02ea02a17c8961d17f473803b0a2"))
+	( 80000, uint256("0x000000176b70a7fddd5d9fe9cde6ace6fbbaf1cd92f93fbe0a5cdfc668822530"))
+	(120000, uint256("0x0000004923b3b8c126346d33cf30cb6fe3d646c631ae7885e2c71560dd8b36fc"))
+	(160000, uint256("0x0000084697be26791727bfa0ef74022a64f1fb0ab48632507a26b2ccb0f3c1f9"))
+	(200000, uint256("0x12a5fcf254d8608ca082bcaa2a3a729b8f5711d0b1467fbfcc56e9e547fca543"))
+	(240000, uint256("0x92174bba90d1ad4ba6b2587b208afecbe38b1108cae6da422efafa1fd737c821"))
+	(280000, uint256("0x8bda7e8884fba4947a31e6fa9bfaef59b207336c94d6c09da39b608fefc8aefb"))
+	(320000, uint256("0x86d572656eaf889815c60644beb6342ea774cb7a616e4905433a8f7e0077dfad"))
+	(360000, uint256("0x80fb3c18c3cadf3516f743d24a850890d5aaf027a9c3fa0c5f29bee441c11d88"))
+	(400000, uint256("0x5b7e7e824c0978525d5ca572f7c1bb48bf12a6ae85045520769a95e24e26d109s"))
+	(420000, uint256("0x61ace045d005e2510ea0af133c90b408d0d332dc4f00e202b70ebb13c87a0b64"))
+	;
+
+map<int, uint256> mapSyncHeight2Hash;//height->hash
+map<uint256, int> mapSyncHash2Height;//height->hash
+
+
+int nMaxSlot = 5;
+vector<SyncPoint*> vSyncHeadersPoints;
+vector<SyncPoint*> vSyncBlocksPoints;
+MapBlockHeaders mapBlockHeaders;
+//End
+
 
 
 //////////////////////////////////////////////////////////////////////////////
@@ -478,7 +509,7 @@ bool CTransaction::CheckTransaction() const
         // ppcoin: enforce minimum output amount
         if ((!txout.IsEmpty()) && txout.nValue < MIN_TXOUT_AMOUNT)
             return DoS(100, error("CTransaction::CheckTransaction() : txout.nValue below minimum"));
-        if (txout.nValue > MAX_MONEY)
+        if (txout.nValue > GetMaxMoney())
             return DoS(100, error("CTransaction::CheckTransaction() : txout.nValue too high"));
         nValueOut += txout.nValue;
         if (!MoneyRange(nValueOut))
@@ -547,12 +578,12 @@ int64 CTransaction::GetMinFee(unsigned int nBlockSize, bool fAllowFree,
     if (nBlockSize != 1 && nNewBlockSize >= MAX_BLOCK_SIZE_GEN/2)
     {
         if (nNewBlockSize >= MAX_BLOCK_SIZE_GEN)
-            return MAX_MONEY;
+            return GetMaxMoney();
         nMinFee *= MAX_BLOCK_SIZE_GEN / (MAX_BLOCK_SIZE_GEN - nNewBlockSize);
     }
 
     if (!MoneyRange(nMinFee))
-        nMinFee = MAX_MONEY;
+        nMinFee = GetMaxMoney();
     return nMinFee;
 }
 
@@ -1314,9 +1345,9 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs,
     // fBlock is true when this is called from AcceptBlock when a new best-block is added to the blockchain
     // fMiner is true when called from the internal bitcoin miner
     // ... both are false when called from CTransaction::AcceptToMemoryPool
+	int64 nValueIn = 0;
     if (!IsCoinBase())
     {
-        int64 nValueIn = 0;
         int64 nFees = 0;
         for (unsigned int i = 0; i < vin.size(); i++)
         {
@@ -1415,6 +1446,19 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs,
                 return DoS(100, error("ConnectInputs() : nFees out of range"));
         }
     }
+
+	//prevent the burst of money supply
+	if(GetMaxMoney() == MAX_MONEY_10_3_3)
+	{
+		if (IsCoinStake())
+		{
+			int64 nStakeReward = GetValueOut() - nValueIn;
+			if((nStakeReward * MAX_INTEREST) > (nValueIn))
+			{
+                return DoS(100, error("ConnectInputs() : %s stake reward exceeded 0.003", GetHash().ToString().c_str()));
+			}
+		}
+	}
 
     return true;
 }
@@ -2210,7 +2254,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 			// If don't already have its previous block, shunt it off to holding area until we get it
 			if (!mapBlockIndex.count(pblock->hashPrevBlock))
 			{
-				printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().substr(0,20).c_str());
+				if(fDebug)
+					printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().substr(0,20).c_str());
 				CBlock* pblock2 = new CBlock(*pblock);
 				// ppcoin: check proof-of-stake
 				if (pblock2->IsProofOfStake())
@@ -2228,7 +2273,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 				// Ask this guy to fill in what we're missing
 				if (pfrom)
 				{
-					pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
+					if (!IsInitialBlockDownload())
+						pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
 					// ppcoin: getblocks may not obtain the ancestor block rejected
 					// earlier by duplicate-stake check so we ask for it again directly
 					if (!IsInitialBlockDownload())
@@ -2268,7 +2314,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     // If don't already have its previous block, shunt it off to holding area until we get it
     if (!mapBlockIndex.count(pblock->hashPrevBlock))
     {
-        printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().substr(0,20).c_str());
+    	if(fDebug)
+        	printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().substr(0,20).c_str());
         CBlock* pblock2 = new CBlock(*pblock);
         // ppcoin: check proof-of-stake
         if (pblock2->IsProofOfStake())
@@ -2286,7 +2333,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         // Ask this guy to fill in what we're missing
         if (pfrom)
         {
-            pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
+        	if (!IsInitialBlockDownload())
+            	pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
             // ppcoin: getblocks may not obtain the ancestor block rejected
             // earlier by duplicate-stake check so we ask for it again directly
             if (!IsInitialBlockDownload())
@@ -2311,6 +2359,19 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         {
             CBlock* pblockOrphan = (*mi).second;
 			 printf("ProcessOrphanBlock, hash:%s\n", pblockOrphan->GetHash().ToString().substr(0,20).c_str());
+
+			  if (pblockOrphan->IsProofOfStake())
+    		  {
+			        uint256 hashProofOfStake = 0;
+					int iRet = CheckProofOfStake( pblockOrphan->vtx[1], pblockOrphan->nBits, hashProofOfStake);
+
+					if(iRet == 1)
+					{
+						if (!mapProofOfStake.count(pblockOrphan->GetHash())) // add to mapProofOfStake
+							 mapProofOfStake.insert(make_pair(pblockOrphan->GetHash(), hashProofOfStake));
+					}
+			  }
+			  
             if (pblockOrphan->AcceptBlock())
                 vWorkQueue.push_back(pblockOrphan->GetHash());
             mapOrphanBlocks.erase(pblockOrphan->GetHash());
@@ -3234,7 +3295,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
         // ppcoin: record my external IP reported by peer
         if (addrFrom.IsRoutable() && addrMe.IsRoutable())
+        {
+        	if(fDebug)
+        		printf("ip:%s, addrme:%s\n", pfrom->addr.ToString().c_str(), addrMe.ToString().c_str());
             addrSeenByPeer = addrMe;
+			AddLocal(addrMe, LOCAL_IRC);
+        }
 
         // Be shy and don't send version until we hear
         if (pfrom->fInbound)
@@ -3259,7 +3325,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             }
 
             // Get recent addresses
-            if (pfrom->fOneShot || pfrom->nVersion >= CADDR_TIME_VERSION || addrman.size() < 1000)
+            if (pfrom->fOneShot || pfrom->nVersion >= GETADDR_VERSION_START|| addrman.size() < 1000)
             {
                 pfrom->PushMessage("getaddr");
                 pfrom->fGetAddr = true;
@@ -3332,12 +3398,16 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         vRecv >> vAddr;
 
         // Don't want addr from older versions unless seeding
-        if (pfrom->nVersion < CADDR_TIME_VERSION && addrman.size() > 1000)
+        if (pfrom->nVersion < GETADDR_VERSION_START)
+        {
+        	printf("ip:%s, reject addr added, version:%d\n", pfrom->addr.ToString().c_str(), pfrom->nVersion);
             return true;
+        }
+		
         if (vAddr.size() > 1000)
         {
             pfrom->Misbehaving(20);
-            return error("message addr size() = %"PRIszu"", vAddr.size());
+            return error("ip:%s, message addr size() = %"PRIszu"", pfrom->addr.ToString().c_str(), vAddr.size());
         }
 
         // Store the new addresses
@@ -3386,6 +3456,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                 vAddrOk.push_back(addr);
         }
         addrman.Add(vAddrOk, pfrom->addr, 2 * 60 * 60);
+
+		printf("ip:%s, addr added, size() = %"PRIszu"\n", pfrom->addr.ToString().c_str(), vAddrOk.size());
+		
         if (vAddr.size() < 1000)
             pfrom->fGetAddr = false;
         if (pfrom->fOneShot)
@@ -3403,7 +3476,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             return error("message inv size() = %"PRIszu"", vInv.size());
         }
 
-		{
+		/*{
 			LOCK(cs_vNodes);
 			CNode* pnode = getNodeSync();
 			if(pnode != NULL && pfrom != pnode)
@@ -3417,6 +3490,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 				pnode->nSyncHeight = nBestHeight;
 				printf("ip:%s, reset synctime:%"PRI64d", current height:%d\n", pnode->addr.ToString().c_str(), pnode->nSyncTime , pnode->nSyncHeight);
 			}
+		}*/
+
+		if(IsInitialBlockDownload())
+		{
+			if(fDebug)
+				printf("ignore inv when concurrentsync\n");
+			return true;
 		}
 
         // find last block in inv vector
@@ -3472,7 +3552,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         if (fDebugNet || (vInv.size() != 1))
             printf("received getdata (%"PRIszu" invsz)\n", vInv.size());
 
-		{
+		/*{
 			LOCK(cs_vNodes);
 			CNode* pnode = getNodeSync();
 			if(pnode != NULL && pnode->fStartSync)
@@ -3480,6 +3560,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 				return error("receive getdata msg from ip:%s, ignore it because i'm syncing", 
 					pfrom->addr.ToString().c_str());
 			}
+		}*/
+
+		
+		if(IsInitialBlockDownload())
+		{
+			if(fDebug)
+				printf("ignore getdata when concurrentsync\n");
+			return true;
 		}
 
         /*BOOST_FOREACH(const CInv& inv, vInv)
@@ -3559,7 +3647,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         int nLimit = 500;
         printf("getblocks %d to %s limit %d\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,20).c_str(), nLimit);
 
-		{
+		/*{
 			LOCK(cs_vNodes);
 			CNode* pnode = getNodeSync();
 			if(pnode != NULL && pnode->fStartSync)
@@ -3567,6 +3655,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 				return error("receive getblocks msg from ip:%s, ignore it because i'm syncing", 
 					pfrom->addr.ToString().c_str());
 			}
+		}*/
+
+		
+		if(IsInitialBlockDownload())
+		{
+			if(fDebug)
+				printf("ignore getblocks when concurrentsync\n");
+			return true;
 		}
 
 		for (; pindex; pindex = pindex->pnext)
@@ -3642,7 +3738,69 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         pfrom->PushMessage("headers", vHeaders);
     }
 
+	//Pennies-concurrent sync
+	//prepare
+	//select best bandwidth connections
+	//trigger
+	//1.under sync
+	//2.
+	else if(strCommand == "headers")
+	{
+		//stage 2.2 receive headers concurrent
+		vector<CLightWalletBlock> vHeaders;
+		vRecv >> vHeaders;
+		printf("received headers, size:%"PRIszu"\n", vHeaders.size());
+		int nTempHeight = 0;
+		pfrom->bHeaderUsed = true;
+		pfrom->nHeaderDownloaded += (int)vHeaders.size();
+		for(int i = 0; i < (int)vHeaders.size(); i++)
+		{
+			CLightWalletBlock cLightWalletBlock = vHeaders[i];
+			//printf("received header, prevhash:%s\n", cLightWalletBlock.hashPrevBlock.ToString().c_str());
+			map<uint256, int>::iterator mi = mapSyncHash2Height.find(cLightWalletBlock.hashPrevBlock);
+			if(mi == mapSyncHash2Height.end())
+			{
+				if(0 == nTempHeight)
+				{
+					printf("receive invalid header, hash:%s\n", cLightWalletBlock.hashPrevBlock.ToString().c_str());
+					break;
+				}
+				mapSyncHash2Height.insert(std::pair<uint256, int>(cLightWalletBlock.hashPrevBlock,
+											nTempHeight));
+				mapSyncHeight2Hash.insert(std::pair<int, uint256>(nTempHeight, cLightWalletBlock.hashPrevBlock));
+				//printf("ip:%s, getheader, height:%d, hash:%s\n", 
+				//	pfrom->addr.ToString().c_str(), nTempHeight, cLightWalletBlock.hashPrevBlock.ToString().c_str());
 
+
+				CLightWalletBlock* pLightWalletBlock = new CLightWalletBlock();
+				*pLightWalletBlock = cLightWalletBlock;
+				mapBlockHeaders.insert(std::pair<int, CLightWalletBlock*>(nTempHeight,
+											pLightWalletBlock));
+				nTempHeight++;
+			}
+			else
+			{
+				nTempHeight = mi->second + 1;
+				
+			}
+		}
+		
+	}
+	//stage 3.1 send getdata-block concurrent
+	//stage 3.2 receive block concurrent
+	else if(strCommand == "concurrent-req")
+	{
+		//stage 1.1 req split point
+		//format:command+number
+	}
+	else if(strCommand == "concurrent-resp")
+	{
+		//stage 1.2 get split point
+		//format:command+number+array of element
+		//elment format:header + height
+	}
+	//stage 2.1 getheader concurrent
+	//End
     else if (strCommand == "tx")
     {
         vector<uint256> vWorkQueue;
@@ -3719,10 +3877,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         CBlock block;
         vRecv >> block;
 
-        printf("received block %s\n", block.GetHash().ToString().c_str());
+		if(fDebug)
+        	printf("received block %s\n", block.GetHash().ToString().c_str());
         // block.print();
 
-        {
+        /*{
 			LOCK(cs_vNodes);
 			CNode* pnode = getNodeSync();
 			if(pnode != NULL && pfrom != pnode)
@@ -3736,13 +3895,21 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 				pnode->nSyncHeight = nBestHeight;
 				printf("ip:%s, reset synctime:%"PRI64d", current height:%d\n", pnode->addr.ToString().c_str(), pnode->nSyncTime , pnode->nSyncHeight);
 			}
-        }
+        }*/
+
+		pfrom->nDownloaded++;
+		pfrom->bUsed = true;
 		
         CInv inv(MSG_BLOCK, block.GetHash());
         pfrom->AddInventoryKnown(inv);
 
+		//int64 nBegin = GetAdjustedTime();
         if (ProcessBlock(pfrom, &block))
             mapAlreadyAskedFor.erase(inv);
+		//int64 nEnd = GetAdjustedTime();
+
+		//if(nEnd - nBegin > 3)
+		//	printf("process block %"PRI64d", %"PRI64d"\n", nBegin, nEnd);
         if (block.nDoS) pfrom->Misbehaving(block.nDoS);
     }
 
@@ -3750,9 +3917,19 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     else if (strCommand == "getaddr")
     {
         pfrom->vAddrToSend.clear();
-        vector<CAddress> vAddr = addrman.GetAddr();
-        BOOST_FOREACH(const CAddress &addr, vAddr)
-            pfrom->PushAddress(addr);
+		//Pennies just send good IPs
+        //vector<CAddress> vAddr = vNodes.GetAddr();
+        //BOOST_FOREACH(const CAddress &addr, vNodes)
+        //    pfrom->PushAddress(addr);
+        LOCK(cs_vNodes);
+        BOOST_FOREACH(CNode* pnode, vNodes)
+        {
+        	if(pnode->nVersion >= SENDADDR_VERSION_START && pnode->nVersion != ANDROID_VERSION_START)
+        	{
+            	pfrom->PushAddress(pnode->addr);
+        	}
+        }
+ 
     }
 
 
@@ -4156,28 +4333,17 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 pto->PushMessage("addr", vAddr);
         }
 
-        // Start block sync
+        /*// Start block sync
         if (pto->fStartSync) {
             pto->fStartSync = false;
 			
-			/*if(pnodeSync == pnodeLastSync)
-			{
-				//still need to clear the map
-				//clear previous askfor map
-				mapAlreadyAskedFor.clear();
-			}
-			else
-			{
-				//clear previous askfor map
-				mapAlreadyAskedFor.clear();
-			}*/
 			mapAlreadyAskedFor.clear();
 			
             pto->PushGetBlocks(pindexBest, uint256(0));
 			printf("send getblocks to ip:%s, start hash:%s, end:0\n", 
 				pto->addr.ToString().c_str(), 
 				pindexBest != NULL ? pindexBest->GetBlockHash().ToString().c_str() : "0");
-        }
+        }*/
 
 
         //
@@ -4391,6 +4557,7 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake)
     txNew.vin.resize(1);
     txNew.vin[0].prevout.SetNull();
     txNew.vout.resize(1);
+	//printf("create new block\n");
     txNew.vout[0].scriptPubKey << reservekey.GetReservedKey() << OP_CHECKSIG;
 
     // Add our coinbase tx as first transaction

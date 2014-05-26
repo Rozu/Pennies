@@ -226,7 +226,12 @@ public:
 	int nSyncHeight;
 	int nSyncLastHeight;
 	bool bUsed;
+	bool bHeaderUsed;
 	int nSpeed;
+	int nDownloaded;
+	int nHeaderSpeed;
+	int nHeaderDownloaded;
+	int64 nCheckSpeedTime;
 
     // flood relay
     std::vector<CAddress> vAddrToSend;
@@ -240,6 +245,14 @@ public:
     std::vector<CInv> vInventoryToSend;
     CCriticalSection cs_inventory;
     std::multimap<int64, CInv> mapAskFor;
+
+	//concurrent sync
+	int64 nSendGetHeadersTime;
+	int64 nSendGetDataTime;
+	uint256 getHeadersHashBegin;
+	uint256 getHeadersHashEnd;
+	uint256 getDataHashBegin;
+	uint256 getDataHashEnd;
 
     CNode(SOCKET hSocketIn, CAddress addrIn, std::string addrNameIn = "", bool fInboundIn=false) : vSend(SER_NETWORK, MIN_PROTO_VERSION), vRecv(SER_NETWORK, MIN_PROTO_VERSION)
     {
@@ -276,13 +289,25 @@ public:
 		nSyncHeight = 0;
 		nSyncLastHeight = 0;
 		bUsed = false;
+		bHeaderUsed = false;
 		nSpeed = 0;
+		nHeaderSpeed = 0;
+		nDownloaded = 0;
+		nHeaderDownloaded = 0;
+		nCheckSpeedTime = 0;
         fGetAddr = false;
 		fRelayTxes = false;
         nMisbehavior = 0;
         hashCheckpointKnown = 0;
         setInventoryKnown.max_size(SendBufferSize() / 1000);
         pfilter = new CBloomFilter();
+
+		nSendGetHeadersTime = 0;
+		nSendGetDataTime = 0;
+		getHeadersHashBegin = uint256(0);
+		getHeadersHashEnd   = uint256(0);
+		getDataHashBegin    = uint256(0);
+		getDataHashEnd      = uint256(0);
 
         // Be shy and don't send version until we hear
         if (!fInbound)
@@ -755,6 +780,29 @@ inline void RelayMessage<>(const CInv& inv, const CDataStream& ss)
 
     //RelayInventory(inv);
 }*/
+
+
+class SyncPoint{
+public:
+	int startHeight;
+	int endHeight;
+
+	SyncPoint(int start, int end)
+	{
+		startHeight = start;
+		endHeight = end;
+	}
+};
+
+class CLightWalletBlock;
+
+typedef std::map<int, CLightWalletBlock*> MapBlockHeaders;
+
+extern std::vector<SyncPoint*> vSyncHeadersPoints;
+extern std::vector<SyncPoint*> vSyncBlocksPoints;
+extern MapBlockHeaders mapBlockHeaders;
+extern std::map<int, uint256> mapSyncHeight2Hash;
+extern std::map<uint256, int> mapSyncHash2Height;
 
 
 

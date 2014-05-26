@@ -159,6 +159,11 @@ extern bool fLogTimestamps;
 extern bool fLogPerf;
 extern int  nSyncThreshold;
 extern int  nSyncTimer;
+extern int  nConcurrent;
+extern int  nHeaderConcurrent;
+extern int  nConcurrentPollTime;
+extern int  nHeaderConcurrentPollTime;
+extern int  nConcurrentRetry;
 extern bool fReopenDebugLog;
 
 void RandAddSeed();

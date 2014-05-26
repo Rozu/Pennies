@@ -197,6 +197,7 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
             string strAddress;
             ssKey >> strAddress;
             ssValue >> pwallet->mapAddressBook[CBitcoinAddress(strAddress).Get()];
+			//printf("loadwallet, name:%s\n", strAddress.c_str());
         }
         else if (strType == "tx")
         {
@@ -204,12 +205,15 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
             ssKey >> hash;
             CWalletTx& wtx = pwallet->mapWallet[hash];
             ssValue >> wtx;
+			//printf("loadwallet, hash:%s\n", hash.ToString().c_str());
             if (wtx.CheckTransaction() && (wtx.GetHash() == hash))
                 wtx.BindWallet(pwallet);
             else
             {
                 pwallet->mapWallet.erase(hash);
-                return false;
+                //return false;
+                printf("loadwallet erase tx:%s\n", hash.ToString().c_str());
+                return true;
             }
 
             // Undo serialize changes in 31600
@@ -249,6 +253,7 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
             ssKey >> strAccount;
             uint64 nNumber;
             ssKey >> nNumber;
+			//printf("loadwallet, acentry:%s\n", strAccount.c_str());
             if (nNumber > nAccountingEntryNumber)
                 nAccountingEntryNumber = nNumber;
 
@@ -265,6 +270,7 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
             vector<unsigned char> vchPubKey;
             ssKey >> vchPubKey;
             CKey key;
+			//printf("loadwallet key\n");//:%s\n", vchPubKey);
             if (strType == "key")
             {
                 CPrivKey pkey;
@@ -319,6 +325,7 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
             ssKey >> nID;
             CMasterKey kMasterKey;
             ssValue >> kMasterKey;
+			//printf("loadwallet mkey\n");//:%s\n", kMasterKey.ToString().c_str());
             if(pwallet->mapMasterKeys.count(nID) != 0)
             {
                 strErr = strprintf("Error reading wallet database: duplicate CMasterKey id %u", nID);
@@ -334,6 +341,7 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
             ssKey >> vchPubKey;
             vector<unsigned char> vchPrivKey;
             ssValue >> vchPrivKey;
+			//printf("loadwallet, ckey\n");
             if (!pwallet->LoadCryptedKey(vchPubKey, vchPrivKey))
             {
                 strErr = "Error reading wallet database: LoadCryptedKey failed";
@@ -344,16 +352,19 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
         else if (strType == "defaultkey")
         {
             ssValue >> pwallet->vchDefaultKey;
+			//printf("loadwallet defaultkey\n");//:%s\n", pwallet->vchDefaultKey.ToString().c_str());
         }
         else if (strType == "pool")
         {
             int64 nIndex;
             ssKey >> nIndex;
+			//printf("loadwallet keypool insert:%"PRI64d"\n", nIndex);
             pwallet->setKeyPool.insert(nIndex);
         }
         else if (strType == "version")
         {
             ssValue >> nFileVersion;
+			//printf("loadwallet version:%d\n", nFileVersion);
             if (nFileVersion == 10300)
                 nFileVersion = 300;
         }
@@ -363,6 +374,7 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
             ssKey >> hash;
             CScript script;
             ssValue >> script;
+			//printf("loadwallet cscript:%s\n", hash.ToString().c_str());
             if (!pwallet->LoadCScript(script))
             {
                 strErr = "Error reading wallet database: LoadCScript failed";

@@ -80,6 +80,12 @@ bool fLogTimestamps = false;
 bool fLogPerf = false;
 int  nSyncThreshold = 3000;
 int  nSyncTimer = 60;
+int  nConcurrent = 1;
+int  nHeaderConcurrent = 10;
+int  nConcurrentPollTime = 5;
+int  nHeaderConcurrentPollTime = 2;
+int  nConcurrentRetry = 60;
+
 CMedianFilter<int64> vTimeOffsets(200,0);
 bool fReopenDebugLog = false;
 

@@ -107,6 +107,8 @@ class CAddress : public CService
         int64 nLastTry;
 };
 
+
+
 /** inv message data */
 class CInv
 {

@@ -1521,7 +1521,17 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         CTxDB txdb("r");
         if (!txNew.GetCoinAge(txdb, nCoinAge))
             return error("CreateCoinStake : failed to calculate coin age");
-        nCredit += GetProofOfStakeReward(nCoinAge, txNew.nTime);
+		int64 nReward = GetProofOfStakeReward(nCoinAge, txNew.nTime);
+		//prevent the burst of money supply, nCoinAge can not be too large
+		if(GetMaxMoney() == MAX_MONEY_10_3_3)
+		{
+			if((nReward * MAX_INTEREST) > nCredit)
+			{
+				nReward = nCredit / MAX_INTEREST;
+				printf("reduce the reward to :%"PRI64d", coinage:%"PRI64d", valuein:%"PRI64d"\n", nReward, nCoinAge, nCredit);
+			}
+		}
+        nCredit += nReward;
     }
 
     int64 nMinFee = 0;
@@ -1687,6 +1697,7 @@ DBErrors CWallet::LoadWallet(bool& fFirstRunRet)
     {
         if (CDB::Rewrite(strWalletFile, "\x04pool"))
         {
+        	printf("loadwallet clear keypool\n");
             setKeyPool.clear();
             // Note: can't top-up keypool here, because wallet is locked.
             // User will be prompted to unlock wallet the next operation
@@ -1847,8 +1858,13 @@ void CWallet::ReserveKeyFromKeyPool(int64& nIndex, CKeyPool& keypool)
 
         nIndex = *(setKeyPool.begin());
         setKeyPool.erase(setKeyPool.begin());
-        if (!walletdb.ReadPool(nIndex, keypool))
-            throw runtime_error("ReserveKeyFromKeyPool() : read failed");
+        if (!walletdb.ReadPool(nIndex, keypool)){
+			stringstream strErr;
+			strErr << "ReserveKeyFromKeyPool() : read failed:" <<  nIndex;
+            throw runtime_error(strErr.str());
+        }
+		//printf("loadwallet reservekey:%"PRI64d"\n", nIndex);
+		
         if (!HaveKey(keypool.vchPubKey.GetID()))
             throw runtime_error("ReserveKeyFromKeyPool() : unknown key in key pool");
         assert(keypool.vchPubKey.IsValid());
@@ -1866,6 +1882,7 @@ int64 CWallet::AddReserveKey(const CKeyPool& keypool)
         int64 nIndex = 1 + *(--setKeyPool.end());
         if (!walletdb.WritePool(nIndex, keypool))
             throw runtime_error("AddReserveKey() : writing added key failed");
+		 //printf("loadwallet keypool add %"PRI64d"\n", nIndex);
         setKeyPool.insert(nIndex);
         return nIndex;
     }
@@ -1890,7 +1907,7 @@ void CWallet::ReturnKey(int64 nIndex)
         LOCK(cs_wallet);
         setKeyPool.insert(nIndex);
     }
-    // WM - printf("keypool return %"PRI64d"\n", nIndex);
+     //printf("loadwallet keypool return %"PRI64d"\n", nIndex);
 }
 
 bool CWallet::GetKeyFromPool(CPubKey& result, bool fAllowReuse)
@@ -2128,6 +2145,7 @@ CPubKey CReserveKey::GetReservedKey()
     if (nIndex == -1)
     {
         CKeyPool keypool;
+		//printf("wallet getreservedkey\n");
         pwallet->ReserveKeyFromKeyPool(nIndex, keypool);
         if (nIndex != -1)
             vchPubKey = keypool.vchPubKey;
