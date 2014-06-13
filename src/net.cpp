@@ -2420,6 +2420,8 @@ void processConcurrentSync()
 	syncHeaders(nMaxSlot, vNodesToSync);
 	syncBlocks(nMaxSlot, vNodesToSync);
 	
+	if((nNow - nCheckIPTime) > 60)
+	{
 
 	//check chain
 	if(NULL != pindexBest)
@@ -2470,8 +2472,7 @@ void processConcurrentSync()
 	}
 
 	
-	if((nNow - nCheckIPTime) > 60)
-	{
+
 		int i = 0;
 		printf("concurrent sync begin-------------------------------------------------------\n");//for grep
 		BOOST_FOREACH(CNode* pnode, vNodesToSync) {
