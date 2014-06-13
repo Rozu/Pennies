@@ -1140,15 +1140,24 @@ bool IsInitialBlockDownload()
 {
     if (pindexBest == NULL || nBestHeight < Checkpoints::GetTotalBlocksEstimate())
         return true;
-    static int64 nLastUpdate;
-    static CBlockIndex* pindexLastBest;
-    if (pindexBest != pindexLastBest)
-    {
-        pindexLastBest = pindexBest;
-        nLastUpdate = GetTime();
-    }
-    return (GetTime() - nLastUpdate < 10 &&
-            pindexBest->GetBlockTime() < GetTime() - 24 * 60 * 60);
+    //static int64 nLastUpdate;
+    //static CBlockIndex* pindexLastBest;
+	int64 nCurrentTime = GetTime();
+    //if (pindexBest != pindexLastBest)
+    //{
+        //pindexLastBest = pindexBest;
+        //nLastUpdate = GetTime();
+    //}
+
+    bool ret = //(nCurrentTime - nLastUpdate < 10 &&
+            pindexBest->GetBlockTime() < nCurrentTime - 24 * 60 * 60;//);
+	/*if(fDebug)
+		printf("check initialbockdownload, current:%s, lastupdate:%s, best blocktime:%s, ret:%d\n"
+		, DateTimeStrFormat("%x %H:%M:%S", nCurrentTime).c_str()
+		, DateTimeStrFormat("%x %H:%M:%S", nLastUpdate).c_str()
+		, DateTimeStrFormat("%x %H:%M:%S", pindexBest->GetBlockTime()).c_str(), ret);*/
+
+	return ret;
 }
 
 void static InvalidChainFound(CBlockIndex* pindexNew)
@@ -1448,7 +1457,8 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs,
     }
 
 	//prevent the burst of money supply
-	if(GetMaxMoney() == MAX_MONEY_10_3_3)
+	if(GetMaxMoney() == MAX_MONEY_10_3_3
+		&& pindexBlock->GetBlockTime() > MAX_MONEY_10_3_3_EFFECTIVE_DATE)
 	{
 		if (IsCoinStake())
 		{
@@ -2358,6 +2368,9 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
              ++mi)
         {
             CBlock* pblockOrphan = (*mi).second;
+			if(pblockOrphan->GetHash() == uint256(0))
+				continue;
+			
 			 printf("ProcessOrphanBlock, hash:%s\n", pblockOrphan->GetHash().ToString().substr(0,20).c_str());
 
 			  if (pblockOrphan->IsProofOfStake())
@@ -3254,7 +3267,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         }
 
         // Disconnect any versions older than Pennies 0.10.0.0
-        if(pfrom->nVersion < 70000)
+        if(pfrom->nVersion < 70003)
         {
             badVersion = true;
         }

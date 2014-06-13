@@ -90,6 +90,8 @@ CCriticalSection cs_setservAddNodeAddresses;
 static CSemaphore *semOutbound = NULL;
 
 extern std::map<int, uint256> mapHardenSyncPoints;
+extern set<pair<COutPoint, unsigned int> > setStakeSeenOrphan;
+
 
 
 void AddOneShot(string strDest)
@@ -2418,6 +2420,54 @@ void processConcurrentSync()
 	syncHeaders(nMaxSlot, vNodesToSync);
 	syncBlocks(nMaxSlot, vNodesToSync);
 	
+
+	//check chain
+	if(NULL != pindexBest)
+	{
+		int nNextHeight = pindexBest->nHeight + 1;
+		map<int, uint256>::const_iterator begin = mapSyncHeight2Hash.find(nNextHeight);
+		while(begin != mapSyncHeight2Hash.end())
+		{
+			uint256 uHash = begin->second;
+
+				if(mapBlockIndex.count(uHash))
+				{
+					CTxDB txdb;
+            		CBlockIndex* pindexCheckpoint = mapBlockIndex[uHash];
+                	CBlock block;
+                	if (!block.ReadFromDisk(pindexCheckpoint))
+                    {
+                    	printf("add block: ReadFromDisk failed for hash %s, height:%d\n", uHash.ToString().c_str(), nNextHeight);
+						break;
+					}
+               		if (!block.SetBestChain(txdb, pindexCheckpoint))
+                	{
+						printf("add block: set bestchain failed for hash %s, height:%d\n", uHash.ToString().c_str(), nNextHeight);
+						break;
+                	}
+            		txdb.Close();
+					nNextHeight++;
+					begin = mapSyncHeight2Hash.find(nNextHeight);
+					continue;
+				}
+				
+				if(mapOrphanBlocks.count(uHash))
+				{
+					 CBlock* pblockOrphan = mapOrphanBlocks[uHash];
+					 printf("add block, hash:%s, height:%d\n", uHash.ToString().c_str(), nNextHeight);
+					 if(!pblockOrphan->AcceptBlock())
+					 {
+					 	break;
+					 }
+					 mapOrphanBlocks.erase(pblockOrphan->GetHash());
+					 setStakeSeenOrphan.erase(pblockOrphan->GetProofOfStake());
+					 delete pblockOrphan;
+				}
+
+			nNextHeight++;
+			begin = mapSyncHeight2Hash.find(nNextHeight);
+		}
+	}
 
 	
 	if((nNow - nCheckIPTime) > 60)
